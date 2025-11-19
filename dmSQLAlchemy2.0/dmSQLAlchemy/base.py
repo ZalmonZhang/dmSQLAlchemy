@@ -3404,7 +3404,7 @@ class DMDialect(default.DefaultDialect):
             return [self.normalize_name(row[0]) for row in mat_view_names]
         else:
             return [row[0] for row in mat_view_names]
-    
+
     @reflection.cache
     def get_view_definition(
         self,
@@ -3419,30 +3419,45 @@ class DMDialect(default.DefaultDialect):
 
         result1 = None
         result2 = None
-        first_flag = True
-        second_flag = True
+        view_find_flag = True
+        mview_find_flag = False
+        first_error = None
+        second_error = None
 
         try:
             text = "SELECT DBMS_METADATA.GET_DDL(\'VIEW\', \'%(name)s\' , \'%(owner)s\')"
             text = text % {'name': name, 'owner': owner}
             result1 = connection.execute(sql.text(text)).scalar()
-        except Exception:
-            first_flag = False
+        except Exception as e:
+            first_error = e
+            view_find_flag = False
 
-        try:
-            text = "SELECT DBMS_METADATA.GET_DDL(\'MATERIALIZED_VIEW\', \'%(name)s\' , \'%(owner)s\')"
-            text = text % {'name': name, 'owner': owner}
-            result2 = connection.execute(sql.text(text)).scalar()
-        except Exception:
-            second_flag = False
+        if not view_find_flag:
+            try:
+                text = "SELECT DBMS_METADATA.GET_DDL(\'MATERIALIZED_VIEW\', \'%(name)s\' , \'%(owner)s\')"
+                text = text % {'name': name, 'owner': owner}
+                result2 = connection.execute(sql.text(text)).scalar()
+                mview_find_flag = True
+            except Exception as e:
+                second_error = e
 
-        if first_flag or second_flag:
-            if first_flag:
+        if view_find_flag or mview_find_flag:
+            if view_find_flag:
                 return result1
             else:
                 return result2
         else:
-            raise exc.NoSuchTableError(name)
+            pattern = r'CODE:(-\d+)'
+            first_code_str = re.findall(pattern, first_error.args[0])
+            first_code = int(first_code_str[0])
+
+            second_code_str = re.findall(pattern, second_error.args[0])
+            second_code = int(second_code_str[0])
+
+            if first_code == second_code and first_code == -20008:
+                raise exc.NoSuchTableError(name)
+            else:
+                raise Exception(first_error.args[0])
 
     @_handle_synonyms_decorator
     def get_multi_check_constraints(self, connection, *, schema, filter_names, dblink=None, scope, kind, include_all=False, **kw):

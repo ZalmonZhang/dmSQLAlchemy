@@ -11,6 +11,7 @@ import decimal
 import re
 import time
 import datetime as dt
+from sqlalchemy.exc import DBAPIError
 from .types import _DMBinary, _DMBoolean, _DMChar, _DMDate, _DMEnum, \
     _DMInteger, _DMInterval, _DMLongVarBinary, _DMLongVarchar, _DMNumeric, \
     _DMNVarChar, _DMRowid, _DMString, _DMText, _DMUnicodeText, INTERVAL, \
@@ -328,8 +329,11 @@ class DMDialect_dmPython(DMDialect):
             cursor = conn.cursor()
             cursor.execute('SET_SESSION_IDENTITY_CHECK(1);')
             return conn
-        except self.dbapi.DatabaseError as err:
-            raise
+        except Exception as err:
+            if hasattr(err, 'args') and type(err.args[0]) is str:
+                raise DBAPIError(err.args[0], 0, None)
+            else:
+                raise
 
     def get_conn_local_code(self, conn):
         self.trace_process('DMDialect_dmPython', 'get_conn_local_code', conn)

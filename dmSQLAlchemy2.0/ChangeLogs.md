@@ -4,6 +4,13 @@
 
 ## ChangeLogs
 
+#### dmSQLAlchemy v2.0.6(2025-06-20)
+
+* 修正了连接错误时返回的错误码，当前连接错误时将返回`DBAPIError`
+* 新增了对于inspector.get_sequence_names与inspect.get_materialized_view_names方法的支持
+* 修正了inspect.get_schema_names方法无法获取所有模式名的问题
+* 新增了对于JSON类型的支持
+
 #### dmSQLAlchemy v2.0.5(2025-01-21)
 
 * 修复了连接句柄使用 `IPV6` 格式主机名无法连接到数据库的问题

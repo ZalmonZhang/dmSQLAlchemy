@@ -10,6 +10,7 @@ from importlib.metadata import version
 import decimal
 import re
 import json
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.engine import cursor as _cursor
 from .types import _DMBinary, _DMBoolean, _DMChar, _DMDate, _DMEnum, \
      _DMInteger, _DMInterval, _DMLongVarBinary, _DMLongVarchar, _DMNumeric, \
@@ -81,7 +82,7 @@ class DMExecutionContext_dmPython(DMExecutionContext):
                                 index_temp = index
                                 for i in range(index_temp):
                                     if positiontup[i] not in keys_list:
-                                        pattern = re.compile(r'^' + positiontup[i] + '_\d+$')
+                                        pattern = re.compile(r'^' + positiontup[i] + r'_\d+$')
                                         result = [item for item in keys_list if pattern.match(item)]
                                         index = (index - 1 + len(result))
                                 if (type(compiled_param) == dict):
@@ -306,8 +307,11 @@ class DMDialect_dmPython(DMDialect):
             cursor = conn.cursor();
             cursor.execute('SET_SESSION_IDENTITY_CHECK(1);')
             return conn
-        except self.dbapi.DatabaseError as err:
-            raise
+        except Exception as err:
+            if hasattr(err, 'args') and type(err.args[0]) is str:
+                raise DBAPIError(err.args[0], 0, None)
+            else:
+                raise
         
     def get_conn_local_code(self, conn):
         self.trace_process('DMDialect_dmPython', 'get_conn_local_code', conn)
