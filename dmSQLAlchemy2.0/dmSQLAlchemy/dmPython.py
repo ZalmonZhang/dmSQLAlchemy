@@ -1,21 +1,24 @@
 from __future__ import absolute_import
 
-from .base import DMCompiler, DMDialect, DMExecutionContext
-from . import base as dm
-import sqlalchemy.engine.result as _result
-from sqlalchemy import types as sqltypes, util, exc
-import ipaddress
-import random
-from importlib.metadata import version
-import decimal
 import re
 import json
+import random
+import decimal
+import ipaddress
+from . import base as dm
+from .globalvars import globalvars
 from sqlalchemy.exc import DBAPIError
+from importlib.metadata import version
+import sqlalchemy.engine.result as _result
+from sqlalchemy import types as sqltypes, util, exc
+from .base import DMCompiler, DMDialect, DMExecutionContext, DMDialect_Adapter, DMMySQLDialect_Adapter, Quote_Method, No_Quote_Method, \
+    NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, OracleCompatible_Mode
 from sqlalchemy.engine import cursor as _cursor
 from .types import _DMBinary, _DMBoolean, _DMChar, _DMDate, _DMEnum, \
-     _DMInteger, _DMInterval, _DMLongVarBinary, _DMLongVarchar, _DMNumeric, \
+     _DMInteger, _DMInterval, _DMLongVarchar, _DMNumeric, \
      _DMNVarChar, _DMRowid, _DMString, _DMText, _DMUnicodeText, INTERVAL, \
-     LONGVARCHAR, ROWID, _DMBLOB, DMBINARY, ARRAYCLOB, JSON, JSONIndexType, JSONPathType
+     LONGVARCHAR, ROWID, _DMBLOB, DMBINARY, ARRAYCLOB, JSON, JSONIndexType, JSONPathType,\
+     VECTORTYPE, VECTOR
 
 class DMCompiler_dmPython(DMCompiler):
 
@@ -37,7 +40,7 @@ class DMCompiler_dmPython(DMCompiler):
 class DMExecutionContext_dmPython(DMExecutionContext):
     out_parameters = None
 
-    version_info = version('dmPython').split(".")
+    version_info = globalvars.get_var('DMPYTHON_VERSION').split(".")
 
     support_stream = int(version_info[0]) > 2 or (int(version_info[0]) == 2 and int(version_info[1]) > 5) or (int(version_info[0]) == 2 and int(version_info[1]) == 5 and int(version_info[2]) > 9)
 
@@ -176,6 +179,12 @@ class DMDialect_dmPython(DMDialect):
     supports_unicode_statements = True
     supports_unicode_binds = True
 
+    # dmSession parse_type add_quote_all compatible_mode
+    parse_stmt_func = None
+    parse_module = DMDialect_Adapter
+    quote_module = No_Quote_Method
+    compatible_module = NoCompatible_Mode
+
     driver = "dmPython"
 
     def my_json_deserializer(self,value):
@@ -199,9 +208,8 @@ class DMDialect_dmPython(DMDialect):
 
     _json_serializer=my_json_serializer
 
-    colspecs = colspecs = {
+    colspecs = {
         sqltypes.Numeric: _DMNumeric,
-        # generic type, assume datetime.date is desired
         sqltypes.Date: _DMDate,
         sqltypes._Binary: _DMBinary,
         sqltypes.Boolean: _DMBoolean,
@@ -221,15 +229,14 @@ class DMDialect_dmPython(DMDialect):
         sqltypes.JSON.JSONPathType: JSONPathType,
         LONGVARCHAR: _DMLongVarchar,
 
-        # this is only needed for OUT parameters.
-        # it would be nice if we could not use it otherwise.
         sqltypes.Integer: _DMInteger,
         sqltypes.INTEGER: _DMInteger,
 
         sqltypes.Unicode: _DMNVarChar,
         sqltypes.NVARCHAR: _DMNVarChar,
         ROWID: _DMRowid,
-        sqltypes.ARRAY: ARRAYCLOB
+        sqltypes.ARRAY: ARRAYCLOB,
+        VECTORTYPE: VECTOR,
     }
 
     execute_sequence_format = list
@@ -294,6 +301,48 @@ class DMDialect_dmPython(DMDialect):
         self.trace_process('DMDialect_dmPython', 'connect', *cargs, **cparams)
         
         try:
+            compatible_mode = None
+            if 'compatible_mode' in cparams:
+                if type(cparams['compatible_mode']) is str and cparams['compatible_mode'].upper() in ['DM', 'MYSQL', 'TSQL', 'ORACLE']:
+                    compatible_mode = cparams['compatible_mode'].upper()
+                    del cparams['compatible_mode']
+                    if compatible_mode == 'MYSQL':
+                        self.compatible_module = MySQLCompatible_Mode
+                    elif compatible_mode == 'TSQL':
+                        self.compatible_module = TSQLCompatible_Mode
+                    elif compatible_mode == 'ORACLE':
+                        self.compatible_module = OracleCompatible_Mode
+                else:
+                    raise ValueError("The compatible_mode must be of string type and specified within the scope of DM, Oracle, MYSQL and TSQL")
+
+            if 'parse_type' in cparams:
+                parse_type = cparams['parse_type']
+                if type(parse_type) is str and parse_type.upper() in ['DM', 'MYSQL', 'TSQL']:
+                    if parse_type.upper() == 'MYSQL':
+                        if compatible_mode == None:
+                            self.compatible_module = MySQLCompatible_Mode
+                        self.parse_module = DMMySQLDialect_Adapter
+                        self.parse_stmt_func = parse_mysql_stmt
+                    elif parse_type.upper() == 'TSQL':
+                        if compatible_mode == None:
+                            self.compatible_module = TSQLCompatible_Mode
+                        self.parse_stmt_func = parse_tsql_stmt
+                else:
+                    raise ValueError("The parse_type must be of string type and specified within the scope of DM, MYSQL and TSQL")
+
+            if 'cursorclass' in cparams:
+                if cparams['cursorclass'] != 0:
+                    raise ValueError("In dmSQLAlchemy, the cursorclass option is only allowed to be dmPython.TupleCursor")
+
+            if 'add_quote_all' in cparams:
+                quote_type = cparams['add_quote_all']
+                if type(quote_type) is bool:
+                    if quote_type is True:
+                        self.quote_module = Quote_Method
+                    del cparams['add_quote_all']
+                else:
+                    raise ValueError("The add_quote_all must be of bool type")
+
             conn = self.dbapi.connect(*cargs, **cparams)
             
             self.encoding = self.get_conn_local_code(conn)
@@ -304,8 +353,15 @@ class DMDialect_dmPython(DMDialect):
             else:
                 self.requires_name_normalize = False
                         
-            cursor = conn.cursor();
-            cursor.execute('SET_SESSION_IDENTITY_CHECK(1);')
+            cursor = conn.cursor()
+            cursor.execute('SELECT MODE$ FROM V$instance;')
+            result = cursor.fetchall()
+            if result is not None:
+                mode_str = result[0][0]
+                if (mode_str != 'STANDBY'):
+                    cursor.execute('SELECT SET_SESSION_IDENTITY_CHECK(1);')
+            else:
+                cursor.execute('SELECT SET_SESSION_IDENTITY_CHECK(1);')
             return conn
         except Exception as err:
             if hasattr(err, 'args') and type(err.args[0]) is str:
@@ -513,51 +569,9 @@ class DMDialect_dmPython(DMDialect):
                         result_string = json.dumps(list_element)
                     list_element = result_string
                     parameters[i][j] = list_element
-        if context.out_parameters != None and len(context.out_parameters) > 0:
-            dict_len = len(context.out_parameters)
-            poslist = []
-            for k in range(dict_len):
-                for j in range(columns):
-                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
-                        poslist.append(j)
-                        break
-            poslist, parameters = self.check_position(poslist, parameters)
-            result = cursor.executemany(statement, parameters)
-            for k in range(dict_len):
-                if result[poslist[k]] == [None]:
-                    context.out_parameters['ret_' + str(k)] = []
-                else:
-                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
-            return
-        else:
-            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table, "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
-            table_name = self.identifier_preparer.format_table(table_class)
-            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
-                primary_key_list = table_class.primary_key.c._all_columns
-                dict_len = len(primary_key_list)
-                statement = statement + ' RETURNING ' + table_name + '.' + self.do_normalize_name(
-                    self.identifier_preparer.format_column(primary_key_list[0]))
-            else:
-                statement = statement + ' RETURNING ' + table_name + '.ROWID'
-                dict_len = 1
-            for i in range(dict_len - 1):
-                statement = statement + ',' + table_name + '.' + self.do_normalize_name(self.identifier_preparer.format_column(primary_key_list[i + 1]))
-            statement = statement + ' INTO ?'
-            for i in range(dict_len - 1):
-                statement = statement + ', ?'
-            for i in range(rows):
-                for j in range(dict_len):
-                    parameters[i].append(None)
-            result = cursor.executemany(statement, parameters)
-            context.invoked_statement.table._update_true_table = None
-            context.inserted_primary_key_rows = []
-            if dict_len == 1:
-                temp_list = result[columns]
-                for j in range(len(temp_list)):
-                    context.inserted_primary_key_rows.append((temp_list[j],))
-            else:
-                for i in range(dict_len):
-                    context.inserted_primary_key_rows.append(tuple(result[columns + i]))
+
+        self.parse_module.do_executemany_return(self, columns, rows, self, cursor, statement, parameters, context)
+
 
     def do_normalize_name(self, name):
         if name is None:
@@ -565,7 +579,7 @@ class DMDialect_dmPython(DMDialect):
         if name.upper() == name or name.lower() == name:
             return name
         else:
-            return '\"' + name + '\"'
+            return '"' + name + '"'
 
     def do_rollback_twophase(self, connection, xid, is_prepared=True,
                              recover=False):
@@ -578,5 +592,27 @@ class DMDialect_dmPython(DMDialect):
         self.trace_process('DMDialect_dmPython', 'do_commit_twophase', connection, xid, is_prepared, recover)
         
         self.do_commit(connection.connection)
+
+def parse_mysql_stmt(statement):
+    from sqlalchemy.dialects import mysql
+    compile_stmt = statement.compile(dialect=mysql.dialect())
+    if compile_stmt is None:
+        raise NotImplementedError("Unsupported methods by MySQL dialect!")
+    raw_sql = str(compile_stmt)
+    params = compile_stmt.params
+    positiontup = compile_stmt.positiontup
+    for position in positiontup:
+        raw_sql = raw_sql.replace("%s", ":" + position, 1)
+    return raw_sql, params
+
+def parse_tsql_stmt(statement):
+    from sqlalchemy.dialects import mssql
+    compile_stmt = statement.compile(dialect=mssql.dialect())
+    if compile_stmt is None:
+        raise NotImplementedError("Unsupported methods by MSSQL dialect!")
+    raw_sql = str(compile_stmt)
+    params = compile_stmt.params
+    return raw_sql, params
+
 
 dialect = DMDialect_dmPython

@@ -1,8 +1,18 @@
 import re
 import json
-from importlib.metadata import version
+from .globalvars import globalvars
+from sqlalchemy.sql.elements import TextClause
+from typing import Any, TypeVar, Optional, Union, Type
+from sqlalchemy.engine.interfaces import _CoreAnyExecuteParams
+from sqlalchemy.util import await_only
+from sqlalchemy.orm import sessionmaker
+try:
+    from sqlalchemy.orm._typing import OrmExecuteOptionsParameter
+except Exception:
+    from sqlalchemy.engine.interfaces import _ExecuteOptionsParameter as OrmExecuteOptionsParameter
+from sqlalchemy.orm.session import Session, _BindArguments
 from collections import defaultdict
-from sqlalchemy import util, sql,text, Identity
+from sqlalchemy import util, sql, text, Identity, Executable
 from sqlalchemy.engine import default, reflection
 from sqlalchemy.engine import ObjectKind, ObjectScope
 from sqlalchemy.sql import compiler, visitors, expression, util as sql_util
@@ -13,39 +23,20 @@ from functools import wraps
 from sqlalchemy import types as sqltypes, schema as sa_schema
 from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
     BLOB, CLOB, TIME, TIMESTAMP, FLOAT, BIGINT, String, DOUBLE_PRECISION, REAL, INTEGER
-from .types import NUMBER,_DMNumeric
+from .types import NUMBER, _DMNumeric, VECTOR
 from .types import colspecs, ischema_names
 import sqlalchemy.sql.elements
 from datetime import datetime
 from sqlalchemy.schema import Computed
+from sqlalchemy.engine.base import Connection
 import sqlalchemy.exc as exc
 from sqlalchemy.sql.visitors import InternalTraversal
-NO_ARG = util.symbol("NO_ARG")
+from sqlalchemy.engine import Result
+from sqlalchemy.sql._typing import _InfoType
 
-RESERVED_WORDS = \
-    set('IFNULL ABSOLUTE ADD ALL ALTER AND ANY ARRAYLEN AS ASC ASSIGN AUDIT BEGIN BETWEEN '
-        'BIGDATEDIFF BOOL BOTH BSTRING BY BYTE CALL CASE CAST TREAT CHAR CHECK CLUSTER FOR '
-        'COLUMN COMMIT COMMITWORK COMMENT CONNECT CONNECT_BY_ROOT CONSTRAINT CONTAINS GOTO '
-        'CONTEXT CONVERT CORRESPONDING CREATE CRYPTO CURRENT CURSOR DATEADD DATEDIFF IN IF '
-        'DATEPART DECIMAL DECLARE DECODE DEFAULT DELETE DESC DISTINCT DISTRIBUTED DOUBLE IS '
-        'DROP ELSE ELSEIF END EXECUTE EXISTS EXIT EXPLAIN EXTRACT FETCH FINAL FIRST FLOAT '
-        'FOREIGN FROM FULLY FUNCTION GRANT GROUP HAVING IDENTITY IMMEDIATE INDEX INSERT INT '
-        'INTERVAL INTO  LEAD LIKE LOGIN LOOP MEMBER NEW NEXT NOT NULL OBJECT OF ON OR ORDER '
-        'OUT PARTITION PENDANT PERCENT PRIMARY PRINT PRIOR PRIVILEGES PROCEDURE PUBLIC RAISE '
-        'RECORD REF REFERENCES REFERENCE REFERENCING RELATIVE REPEAT RETURN REVERSE REVOKE '
-        'ROLLBACK ROW ROWNUM ROWS SAVEPOINT SCHEMA SELECT SET SOME SUBPARTITION SWITCH SYNONYM '
-        'TABLE TIMESTAMPADD TIMESTAMPDIFF TO TOP TRAIL TRIGGER TRIM TRUNCATE UNION UNIQUE UNTIL '
-        'UPDATE USER USING VALUES VARRAY VIEW WHEN WHENEVER WHILE WITH DISKSPACE RETURNING '
-        'SBYTE SHORT USHORT UINT ULONG VOID CONST DO BREAK CONTINUE THROW FINALLY TRY CATCH '
-        'PROTECTED PRIVATE ABSTRACT SEALED STATIC VIRTUAL OVERRIDE EXTERN CLASS STRUCT GET '
-        'SIZEOF TYPEOF ADMIN REPLICATE VERIFY EQU EXCHANGE CLUSTERBTR LIST ARRAY ROLLUP CUBE '
-        'GROUPING OVER SECTION SETS DOMAIN COLLATION OVERLAY EVERY KEEP WITHIN LNNVL NOCOPY '
-        'INLINE TYPEDEF XMLTABLE XMLNAMESPACES XMLPARSE XMLAGG AUTO_INCREMENT BINARY XMLELEMENT '
-        'XMLATTRIBUTES XMLSERIALIZE XMLQUERY LEXER FLASHBACK NOCYCLE NOSORT OPTIMIZE VERSIONS '
-        'LARGE WITHOUT PIPE XML JSON_TABLE LESS THAN MODEL DIMENSION XMLCAST SQL_CALC_FOUND_ROWS'
-        'YEAR PCTFREE UID MODE WHERE DATETIME DATE LOCK SHARE NOCOMPRESS VALUE LIMIT NOWAIT RAW '
-        'VARCHAR LEVEL EXCLUSIVE THEN INTEGER IDENTIFIED SMALLINT LONG START RENAME VARCHAR2 '
-        'MINUS INTERSECT OPTION SIZE RESOURCE NUMBER COMPRESS'.split())
+NO_ARG = util.symbol("NO_ARG")
+_S = TypeVar("_S", bound="Session")
+_SessionBind = Union["Engine", "Connection"]
 
 NO_ARG_FNS = set('UID CURRENT_DATE SYSDATE USER '
                  'CURRENT_TIME CURRENT_TIMESTAMP'.split())
@@ -333,7 +324,17 @@ class DMTypeCompiler(compiler.GenericTypeCompiler):
 
     def visit_JSON(self,type_,**kw):
         return "JSON"
-        
+
+    def visit_VECTOR(self,type_,**kw):
+        if type_.dim is not None or type_.format is not None:
+            if type_.dim is not None:
+                if type_.format is not None:
+                    return "VECTOR(%s, %s)" % (type_.dim, type_.format)
+                else:
+                    return "VECTOR(%s)" % type_.dim
+        else:
+            return "VECTOR"
+
     def visit_SMALLINT(self, type_, **kw):
         self.dialect.trace_process('DMTypeCompiler', 'visit_SMALLINT', type_, **kw)
         return super(DMTypeCompiler, self).visit_SMALLINT(type_, **kw)
@@ -497,6 +498,11 @@ class DMCompiler(compiler.SQLCompiler):
         self.dialect.trace_process('DMCompiler', 'visit_sequence', seq, **kw)
         return self.preparer.format_sequence(seq) + ".nextval"
 
+    def visit_on_duplicate_key_update(self, on_duplicate, **kw):
+        self.dialect.trace_process('DMCompiler', 'visit_on_duplicate_key_update', on_duplicate, **kw)
+        from sqlalchemy.dialects.mysql.base import MySQLCompiler
+        return MySQLCompiler.visit_on_duplicate_key_update(self, on_duplicate, **kw)
+
     def get_render_as_alias_suffix(self, alias_name_text):
         self.dialect.trace_process('DMCompiler', 'get_render_as_alias_suffix', alias_name_text)
         return " " + alias_name_text
@@ -656,16 +662,8 @@ class DMCompiler(compiler.SQLCompiler):
 
         text = ""
 
-        if select._offset_clause is not None:
-            offset_str = self.process(select._offset_clause, **kw)
-            text += "\n OFFSET %s ROWS" % offset_str
+        text += self.dialect.parse_module.limit_offset_clause(self, self, select, fetch_clause, fetch_clause_options, **kw)
 
-        if fetch_clause is not None:
-            text += "\n FETCH FIRST %s%s ROWS %s" % (
-                self.process(fetch_clause, **kw),
-                " PERCENT" if fetch_clause_options["percent"] else "",
-                "WITH TIES" if fetch_clause_options["with_ties"] else "ONLY",
-            )
         return text
 
     def for_update_clause(self, select, **kw):
@@ -687,10 +685,6 @@ class DMCompiler(compiler.SQLCompiler):
             tmp += " SKIP LOCKED"
 
         return tmp
-    
-    def current_executable(self):
-        self.dialect.trace_process('DMCompiler', 'current_executable')
-        return super(DMCompiler, self).current_executable()
     
     def delete_extra_from_clause(
         self, update_stmt, from_table, extra_froms, from_hints, **kw
@@ -737,7 +731,7 @@ class DMCompiler(compiler.SQLCompiler):
     def is_subquery(self):
         self.dialect.trace_process('DMCompiler', 'is_subquery')
         return super(DMCompiler, self).is_subquery()
-        
+
     def order_by_clause(self, select, **kw):
         self.dialect.trace_process('DMCompiler', 'order_by_clause', select, **kw)
         return super(DMCompiler, self).order_by_clause(select, **kw)
@@ -758,10 +752,11 @@ class DMCompiler(compiler.SQLCompiler):
                                    update_stmt, from_table, 
                                    extra_froms, from_hints, 
                                    **kw)
-        return super(DMCompiler, self).update_from_clause(update_stmt,
-                                                          from_table, extra_froms,
-                                                          from_hints,
-                                                          **kw)
+        return "FROM " + ", ".join(
+            t._compiler_dispatch(self, asfrom=True, fromhints=from_hints, **kw)
+            for t in [from_table] + extra_froms
+        )
+
     def update_limit_clause(self, update_stmt):
         self.dialect.trace_process('DMCompiler', 'update_limit_clause', update_stmt)
         return super(DMCompiler, self).update_limit_clause(update_stmt)
@@ -1211,7 +1206,7 @@ class DMCompiler(compiler.SQLCompiler):
         return super(DMCompiler, self)._truncate_bindparam(bindparam)
 
     def _render_json_extract_from_binary(self, binary, operator, **kw):
-        return "json_value(%s, %s)" % (
+        return "JSON_VALUE(%s, %s)" % (
             self.process(binary.left, **kw),
             self.process(binary.right, **kw),
         )
@@ -1250,9 +1245,8 @@ class DMDDLCompiler(compiler.DDLCompiler):
             start_str = '1' if column.server_default.start is None else str(column.server_default.start)
             increment_str = '1' if column.server_default.increment is None else str(column.server_default.increment)
             colspec += " IDENTITY(" + start_str + ", " + increment_str + ")"
-        else:
-            if column.autoincrement == True:
-                colspec += " IDENTITY(1, 1)"
+        elif column.autoincrement == True:
+            colspec += self.dialect.parse_module.autoincrement_str
             
         return colspec        
 
@@ -1473,7 +1467,7 @@ class DMDDLCompiler(compiler.DDLCompiler):
 
 class DMIdentifierPreparer(compiler.IdentifierPreparer):
 
-    reserved_words = set([x.lower() for x in RESERVED_WORDS])
+    reserved_words = set([x.lower() for x in globalvars.get_var('RESERVED_WORDS')])
     illegal_initial_characters = set(
         (str(dig) for dig in range(0, 10))).union(["_", "$"])
 
@@ -1500,8 +1494,39 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
         """Unilaterally identifier-quote any number of strings."""
     
         return tuple([self.quote_identifier(i) for i in ids if i is not None])
-    
-    # for trace only
+
+    def quote(self, ident: str, force: Any = None) -> str:
+        if force is not None:
+            util.warn_deprecated(
+                "The IdentifierPreparer.quote.force parameter is "
+                "deprecated and will be removed in a future release.  This "
+                "flag has no effect on the behavior of the "
+                "IdentifierPreparer.quote method; please refer to "
+                "quoted_name().",
+                version="0.9",
+            )
+
+        force = getattr(ident, "quote", None)
+
+        if force is None:
+            if ident in self._strings:
+                return self._strings[ident]
+            else:
+                self._strings[ident] = self.dialect.quote_module.quote_ident(self, ident)
+                return self._strings[ident]
+        elif force:
+            return self.quote_identifier(ident)
+        else:
+            return self.dialect.quote_module.return_quote_str(self, ident)
+
+    def quote_identifier(self, value: str) -> str:
+
+        value = value.replace(self.dialect.parse_module.escape_quote, self.dialect.parse_module.escape_to_quote)
+        if self._double_percents:
+            value = value.replace("%", "%%")
+
+        return self.dialect.parse_module.initial_quote + value + self.dialect.parse_module.final_quote
+
     def format_alias(self, alias, name=None):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_alias', alias, name)
         return super(DMIdentifierPreparer, self).format_alias(alias, name)
@@ -1517,7 +1542,7 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     def format_sequence(self, sequence, use_schema=True):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_sequence', sequence, use_schema)
         return super(DMIdentifierPreparer, self).format_sequence(sequence, use_schema)
-        
+
     def format_table(self, table, use_schema=True, name=None):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_table', table, use_schema, name)
         return super(DMIdentifierPreparer, self).format_table(table, use_schema, name)
@@ -1525,7 +1550,7 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     def format_table_seq(self, table, use_schema=True):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_table_seq', table, use_schema)
         return super(DMIdentifierPreparer, self).format_table_seq(table, use_schema)
-        
+
 
 class DMExecutionContext(default.DefaultExecutionContext):
     def fire_sequence(self, seq, type_):
@@ -1587,24 +1612,19 @@ class DMExecutionContext(default.DefaultExecutionContext):
         return super(DMExecutionContext, self)._setup_crud_result_proxy()
 
     def _self_process_name(self, name, reserved_words):
-        result_name = name
-        if result_name.lower() in reserved_words or '\"' in result_name or (result_name.upper() != result_name and result_name.lower() != result_name):
-            if '\"' in result_name:
-                result_name = result_name.replace('\"', '\"\"')
-            result_name = '"%s"' % result_name
-        return result_name
+        return self.dialect.quote_module._self_process_name(self, name, reserved_words)
         
     def _set_autoinc_col_from_lastrowid(self, table, autoinc_col, lastrowid):
         self.dialect.trace_process('DMExecutionContext', '_set_autoinc_col_from_lastrowid')
-        reserved_words = set([x.lower() for x in RESERVED_WORDS])
+        reserved_words = set([x.lower() for x in globalvars.get_var('RESERVED_WORDS')])
         table_name = self._self_process_name(table.name, reserved_words)
         autoinc_col_name = self._self_process_name(autoinc_col.name, reserved_words)
-        statement = "select {} from {} where rowid = {}".format(autoinc_col_name, table_name, lastrowid)
-        self.dialect.do_execute(self.cursor, statement, None, None)
+        statement = "select {} from {} where rowid = ?".format(autoinc_col_name, table_name)
+        self.dialect.dm_do_execute(self.cursor, statement, [lastrowid], None)
         return self.cursor.fetchone()[0]
 
     def get_cols_from_lastrowid(self, table, primary_columns, lastrowid):
-        reserved_words = set([x.lower() for x in RESERVED_WORDS])
+        reserved_words = set([x.lower() for x in globalvars.get_var('RESERVED_WORDS')])
 
         table_name = self._self_process_name(table.name, reserved_words)
         statement = "SELECT "
@@ -1613,9 +1633,9 @@ class DMExecutionContext(default.DefaultExecutionContext):
                 statement = statement + ', '
             primary_columns_name = self._self_process_name(primary_columns[i].name, reserved_words)
             statement = statement + primary_columns_name
-        statement = statement + " from {} where rowid = {}".format(table_name, lastrowid)
+        statement = statement + " from {} where rowid = ?".format(table_name)
 
-        self.dialect.do_execute(self.cursor, statement, None, None)
+        self.dialect.dm_do_execute(self.cursor, statement, [lastrowid], None)
         return self.cursor.fetchone()
         
     def _setup_ins_pk_from_lastrowid(self):
@@ -1636,23 +1656,6 @@ class DMExecutionContext(default.DefaultExecutionContext):
         lastrowid = self.get_lastrowid()
         if lastrowid is not None:
             autoinc_col = table._autoincrement_column
-
-            rowid_dict = {'A': 0, 'B': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6, 'H': 7, 'I': 8, 'J': 9,
-                          'K': 10, 'L': 11,
-                          'M': 12, 'N': 13, 'O': 14, 'P': 15, 'Q': 16, 'R': 17, 'S': 18, 'T': 19, 'U': 20,
-                          'V': 21, 'W': 22,
-                          'X': 23, 'Y': 24, 'Z': 25, 'a': 26, 'b': 27, 'c': 28, 'd': 29, 'e': 30, 'f': 31,
-                          'g': 32, 'h': 33,
-                          'i': 34, 'j': 35, 'k': 36, 'l': 37, 'm': 38, 'n': 39, 'o': 40, 'p': 41, 'q': 42,
-                          'r': 43, 's': 44,
-                          't': 45, 'u': 46, 'v': 47, 'w': 48, 'x': 49, 'y': 50, 'z': 51, '0': 52, '1': 53,
-                          '2': 54, '3': 55,
-                          '4': 56, '5': 57, '6': 58, '7': 59, '8': 60, '9': 61, '+': 62, '/': 63}
-            rowid_temp = 0
-            for i in lastrowid[-8:]:
-                rowid_temp = rowid_temp * 64 + rowid_dict[i]
-            lastrowid = rowid_temp
-
             columns_autoinc_first = table.primary_key.columns_autoinc_first
             identity_flag = False
             for col in columns_autoinc_first:
@@ -1725,13 +1728,14 @@ class DMDialect(default.DefaultDialect):
     supports_sane_rowcount = True
     supports_sane_multi_rowcount = False
     supports_multivalues_insert = True
-
     supports_simple_order_by_label = False
     cte_follows_insert = True
 
     supports_sequences = True
     sequences_optional = False
     postfetch_lastrowid = True
+
+    _requires_alias_for_on_duplicate_key = False # MySQL on duplicate方法使用
 
     default_paramstyle = 'named'
     colspecs = colspecs
@@ -1868,6 +1872,10 @@ class DMDialect(default.DefaultDialect):
                 last_pos += 1
             return poslist, parameters
 
+    # For internal use only, with known parameters and no need for returning
+    def dm_do_execute(self, cursor, statement, parameters, context=None):
+        super(DMDialect, self).do_execute(cursor, statement, parameters, context)
+
     def do_execute(self, cursor, statement, parameters, context=None):
         self.trace_process('DMDialect', 'do_execute', cursor, statement, parameters, context)
         if parameters != [] and parameters != None:
@@ -1880,7 +1888,7 @@ class DMDialect(default.DefaultDialect):
                         result_string = json.dumps(list_element)
                     list_element = result_string
                     parameters[i] = list_element
-        version_info = version('dmPython').split(".")
+        version_info = globalvars.get_var('DMPYTHON_VERSION').split(".")
         if int(version_info[0]) > 2 or (int(version_info[0]) == 2 and int(version_info[1]) > 5) or (
                 int(version_info[0]) == 2 and int(version_info[1]) == 5 and int(version_info[2]) > 9):
             if context != None:
@@ -1937,7 +1945,7 @@ class DMDialect(default.DefaultDialect):
                     FROM all_tables a_tables UNION ALL SELECT a_views.view_name AS table_name, a_views.owner AS owner 
                     FROM all_views a_views) tables_and_views 
                     WHERE tables_and_views.table_name = :name AND tables_and_views.owner = :schema_name""").bindparams(name = name[0], schema_name = schema_name))
-        return cursor.first() is not None
+        return cursor.fetchone() is not None
 
     @reflection.cache
     def has_sequence(self, connection, sequence_name, schema = None, dblink = None, **kw):
@@ -1954,43 +1962,26 @@ class DMDialect(default.DefaultDialect):
 
     def normalize_name(self, name):
         self.trace_process('DMDialect', 'normalize_name', name)
-        """convert the given name to lowercase if it is detected as
-        case insensitive.
-
-        this method is only used if the dialect defines
-        requires_name_normalize=True.
-
-        """ 
         if name is None:
             return None
-        if name.upper() == name and not \
-                self.identifier_preparer._requires_quotes(name.lower()):
-            return name.lower()
-        elif name.lower() == name:
-            return quoted_name(name, quote=True)
-        else:
-            return name
+
+        return self.quote_module.normalize_name(self, name)
 
     def denormalize_name(self, name):
         self.trace_process('DMDialect', 'denormalize_name', name)
-        """convert the given name to a case insensitive identifier
-        for the backend if it is an all-lowercase name.
-
-        this method is only used if the dialect defines
-        requires_name_normalize=True.
-
-        """
         if name is None:
             return None
-        elif name.lower() == name and not \
-                self.identifier_preparer._requires_quotes(name.lower()):
-            name = name.upper()
-        return name
+
+        return self.quote_module.denormalize_name(self, name)
 
     def _get_default_schema_name(self, connection):
         self.trace_process('DMDialect', '_get_default_schema_name', connection)
-        return self.normalize_name(
-            connection.execute(sql.text('SELECT USER FROM DUAL')).scalar())
+        if hasattr(connection, 'current_schema') and connection.current_schema is not None:
+            return self.normalize_name(connection.current_schema)
+        elif isinstance(connection, Connection):
+            return self.normalize_name(connection.connection.connection.current_schema)
+        else:
+            return self.normalize_name(connection.execute(sql.text('SELECT USER FROM DUAL')).scalar())
 
     def _resolve_synonym(self, connection, desired_owner=None,
                          desired_synonym=None, desired_table=None):
@@ -2107,13 +2098,14 @@ class DMDialect(default.DefaultDialect):
         else:
             return value
 
-    def _run_batches(self, connection, all_objects, query, query_fllow, dblink, quote_flag = True):
+    def _run_batches(self, connection, all_objects, query, query_fllow, dblink, params: Optional[dict[str, Any]]={}):
         batches = list(all_objects)
 
         while len(batches)>0:
             batch = batches[0:500]
             batches[0:500] = []
 
+            param_count = len(params)
             if dblink and not dblink.startswith("@"):
                 dblink = f"@{dblink}"
 
@@ -2125,25 +2117,21 @@ class DMDialect(default.DefaultDialect):
             temp_query = query
 
             if(len(batch) != 0):
-                if quote_flag == True:
-                    temp_query += '\''
-                    temp_query += str(batch[0])
-                    temp_query += '\''
-                else:
-                    temp_query += str(batch[0])
+                object_name = str(batch[0])
+                param_name = 'param_' + str(param_count)
+                param_count = param_count + 1
+                temp_query += ':' + param_name
+                params[param_name] = object_name
 
             for i in range(len(batch) - 1):
-                if quote_flag == True:
-                    temp_query += ', '
-                    temp_query += '\''
-                    temp_query += str(batch[i + 1])
-                    temp_query += '\''
-                else:
-                    temp_query += ', '
-                    temp_query += str(batch[i + 1])
+                object_name = str(batch[i + 1])
+                param_name = 'param_' + str(param_count)
+                param_count = param_count + 1
+                temp_query += ', :' + param_name
+                params[param_name] = object_name
 
             temp_query += query_fllow
-            result = connection.execute(sql.text(temp_query), execution_options=execution_options)
+            result = connection.execute(sql.text(temp_query), parameters=params, execution_options=execution_options)
             yield from result.mappings()
 
     @reflection.flexi_cache(
@@ -2157,6 +2145,9 @@ class DMDialect(default.DefaultDialect):
 
         schema = self.denormalize_name(schema or self.default_schema_name)
 
+        params = {}
+        params["param_0"] = schema
+        param_count = 2
         sql_str = "SELECT table_name FROM all_tables WHERE "
         if self.exclude_tablespaces:
             sql_str += (
@@ -2166,29 +2157,33 @@ class DMDialect(default.DefaultDialect):
                 )
             )
         sql_str += (
-            "OWNER = :owner "
+            "OWNER = :param_0 "
             "AND DURATION IS NULL ")
 
         if filter_names != None and type(filter_names) is list and len(filter_names) > 0:
-            sql_str += "AND TABLE_NAME IN(\'" + self.denormalize_name(filter_names[0]) + "\'"
+            params["param_1"] = self.denormalize_name(filter_names[0])
+            sql_str += "AND TABLE_NAME IN(:param_1"
 
             for i in range(len(filter_names) - 1):
-                sql_str += ", \'" + self.denormalize_name(filter_names[i + 1] + "\'")
+                param_name = "param_" + str(param_count)
+                param_count += 1
+                params[param_name] = self.denormalize_name(filter_names[i + 1])
+                sql_str += ", :" + param_name
 
             sql_str += ")"
 
-        result = connection.execute(sql.text(sql_str).bindparams(owner=schema)).scalars()
+        result = connection.execute(sql.text(sql_str), parameters=params).scalars()
 
         return result.all()
 
     def get_whether_exists_table(self, connection, table_name, schema):
         query = "SELECT a_objects.object_name, a_objects.object_type\n"\
                 "FROM all_objects a_objects\n"\
-                "WHERE a_objects.owner = \'" + schema + "\'\n"\
+                "WHERE a_objects.owner = :schema\n"\
                 "AND a_objects.object_type IN ('VIEW', 'TABLE', 'MATERIALIZED VIEW')\n"\
-                "AND a_objects.object_name = \'" + table_name + "\';"
+                "AND a_objects.object_name = :table_name;"
 
-        result = connection.execute(sql.text(query)).first()
+        result = connection.execute(sql.text(query).bindparams(schema=schema, table_name=table_name)).first()
 
         if result is None:
             raise exc.NoSuchTableError(
@@ -2232,16 +2227,16 @@ class DMDialect(default.DefaultDialect):
         schema = self.denormalize_name(schema or self.default_schema_name)
         s = "SELECT sequence_name FROM all_sequences \n"\
              "WHERE sequence_owner = :schema ORDER BY sequence_name"
-        result = connection.execute(sql.text(s).bindparams(schema = schema))
+        result = connection.execute(sql.text(s).bindparams(schema=schema))
         return [self.normalize_name(row[0]) for row in result]
 
     @reflection.cache
     def get_schema_names(self, connection, **kw):
         self.trace_process('DMDialect', 'get_schema_names', connection, **kw)
         
-        s = "SELECT a_users.username FROM all_users a_users ORDER BY a_users.username"
+        s = "SELECT NAME FROM SYSOBJECTS WHERE TYPE$ = 'SCH';"
         result = connection.execute(sql.text(s))
-        return [[self.normalize_name(row[0]) for row in result]]
+        return [self.normalize_name(row[0]) for row in result]
 
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kw):
@@ -2254,7 +2249,7 @@ class DMDialect(default.DefaultDialect):
             sql_str += (
                 "nvl(tablespace_name, 'no tablespace') "
                 "NOT IN (%s) AND " % (
-                    ', '.join(["'%s'" % ts for ts in self.exclude_tablespaces])
+                    ', '.join(["'%s'" % ts.replace("'", "''") for ts in self.exclude_tablespaces])
                 )
             )
         sql_str += (
@@ -2277,7 +2272,7 @@ class DMDialect(default.DefaultDialect):
             sql_str += (
                 "nvl(tablespace_name, 'no tablespace') "
                 "NOT IN (%s) AND " % (
-                    ', '.join(["'%s'" % ts for ts in self.exclude_tablespaces])
+                    ', '.join(["'%s'" % ts.replace("'", "''") for ts in self.exclude_tablespaces])
                 )
             )
         sql_str += (
@@ -2316,16 +2311,25 @@ class DMDialect(default.DefaultDialect):
         default = ReflectionDefaults.table_options
 
         if ObjectKind.TABLE in kind or ObjectKind.MATERIALIZED_VIEW in kind:
+            params = {}
+            param_count = 2
             query = "SELECT a_tables.table_name, a_tables.compression, a_tables.compress_for"
-            query += "\nFROM all_tables AS a_tables\nWHERE a_tables.owner = \'" + owner + "\'\nAND a_tables.table_name IN("
+            query += "\nFROM all_tables AS a_tables\nWHERE a_tables.owner = :param_0"
+            params['param_0'] = str(owner)
             if (len(all_objects)>0):
-                query += "\'" + all_objects[0] + "\'"
+                query += "\nAND a_tables.table_name IN("
+                param_name = 'param_1'
+                query += ":" + param_name
+                params['param_1'] = all_objects[0]
                 if(len(all_objects)>1):
                     for i in range(len(all_objects) - 1):
-                        query += ",\'" + all_objects[i+1] + "\'"
-            query += ")"
+                        param_name = 'param_' + str(param_count)
+                        param_count = param_count + 1
+                        query += ", :" + param_name
+                        params[param_name] = all_objects[i + 1]
+                query += ")"
 
-            result = connection.execute(sql.text(query))
+            result = connection.execute(sql.text(query), parameters=params)
 
             for table, compression, compress_for in result:
                 if compression == "ENABLED":
@@ -2359,13 +2363,13 @@ class DMDialect(default.DefaultDialect):
 
         text = "SELECT table_name, compression, compress_for, tablespace_name "\
             "FROM ALL_TABLES%(dblink)s "\
-            "WHERE table_name = "+"'"+table_name+"' "
+            "WHERE table_name = :table_name"
 
         if schema is not None:
-            text += " AND owner =  "+"'"+schema+"' "
+            text += " AND owner =  :schema"
         text = text % {'dblink': dblink}
 
-        result = connection.execute(sql.text(text))
+        result = connection.execute(sql.text(text).bindparams(table_name=table_name, schema=schema))
         get_table_flag = False
         row = result.first()
         if row:
@@ -2410,21 +2414,28 @@ class DMDialect(default.DefaultDialect):
                 "\n         WHEN 0x2000 THEN 'JSON'"\
                 "\n         ELSE a_tab_cols.data_type"\
                 "\n     END"\
+                "\n WHEN 'vector' THEN"\
+                "\n     CASE syscol.scale"\
+                "\n         WHEN 277 THEN 'VECTOR(' || syscol.LENGTH$ || ',FLOAT32)'"\
+                "\n         WHEN 533 THEN 'VECTOR(' || syscol.LENGTH$ || ',FLOAT64)'"\
+                "\n         WHEN 789 THEN 'VECTOR(' || syscol.LENGTH$ || ',INT8)'"\
+                "\n         ELSE a_tab_cols.data_type"\
+                "\n     END"\
                 "\n ELSE a_tab_cols.data_type"\
                 "\nEND AS data_type, a_tab_cols.%(char_length_col)s, "\
                 "\na_tab_cols.data_precision, a_tab_cols.data_scale, a_tab_cols.nullable, a_tab_cols.data_default, "\
                 "\na_col_comments.comments, a_tab_cols.virtual_column FROM ALL_TAB_COLS%(dblink)s a_tab_cols, ALL_COL_COMMENTS a_col_comments, SYSCOLUMNS syscol"\
-                "\nWHERE a_tab_cols.table_name = \'%(table_name)s\'"\
-                "\nAND a_tab_cols.owner = \'%(schema_name)s\'" \
+                "\nWHERE a_tab_cols.table_name = :table_name"\
+                "\nAND a_tab_cols.owner = :schema_name" \
                 "\nAND syscol.name = a_tab_cols.column_name"\
-                "\nAND syscol.id = (select ID from sysobjects where name = \'%(table_name)s\' AND SUBTYPE$ = 'UTAB' AND SCHID = "\
-                "\n(SELECT ID FROM SYSOBJECTS WHERE NAME =  \'%(schema_name)s\' AND TYPE$ = 'SCH'))"\
+                "\nAND syscol.id = (select ID from sysobjects where name = :table_name AND SUBTYPE$ = 'UTAB' AND SCHID = "\
+                "\n(SELECT ID FROM SYSOBJECTS WHERE NAME = :schema_name AND TYPE$ = 'SCH'))"\
                 "\nAND a_tab_cols.table_name = a_col_comments.table_name AND a_tab_cols.column_name = a_col_comments.column_name "\
-                "\nAND a_tab_cols.owner = a_col_comments.schema_name AND a_tab_cols.hidden_column = \'NO\' "\
+                "\nAND a_tab_cols.owner = a_col_comments.schema_name AND a_tab_cols.hidden_column = 'NO' "\
                 "\nORDER BY column_id"
-        text = text % {'table_name' : table_name, 'schema_name' : owner,'dblink': dblink, 'char_length_col': char_length_col}
+        text = text % {'dblink': dblink, 'char_length_col': char_length_col}
 
-        c = connection.execute(sql.text(text))
+        c = connection.execute(sql.text(text).bindparams(table_name=table_name, schema_name=owner))
 
         identity = self.get_identity_info(connection, owner, [table_name], dblink)
 
@@ -2437,10 +2448,16 @@ class DMDialect(default.DefaultDialect):
                     coltype = NUMBER
                 else:
                     coltype = NUMBER(precision, scale)
-            elif coltype in ('VARCHAR', 'VARCHAR2', 'NVARCHAR2', 'CHAR', 'CHARACTER'):
+            elif coltype in ('VARCHAR', 'VARCHAR2', 'NVARCHAR2', 'CHAR', 'CHARACTER', 'LONGVARCHAR', 'LONGVARBINARY'):
                 coltype = self.ischema_names.get(coltype)(length)
+            elif coltype in ('INTEGER', 'INT'):
+                coltype = sqltypes.Integer
             elif 'WITH TIME ZONE' in coltype:
                 coltype = TIMESTAMP(timezone = True)
+            elif 'VECTOR(' in coltype:
+                dim = int(coltype[7:coltype.find(',')])
+                format = coltype[coltype.find(',') + 1:len(coltype) - 1]
+                coltype = VECTOR(dim = dim, format = format)
             else:
                 coltype = re.sub(r'\(\d+\)', '', coltype)
                 try:
@@ -2488,17 +2505,19 @@ class DMDialect(default.DefaultDialect):
 
     def get_identity_info(self, connection, owner, all_objects, dblink):
 
-        query = "select name as col_name, id as tab_id from syscolumns where id IN (select id from sysobjects where name IN ("
-        query_fllow = ") and SUBTYPE$ = 'UTAB' and schid = (select id from sysobjects where name = '"
-        query_fllow += str(owner)
-        query_fllow += "' and TYPE$ = 'SCH') and info3 & 0x3F not in(0x05 ,0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27)) and info2 = 1;"
+        params = {}
+        params["param_0"] = owner
+        query = "select name as \"col_name\", id as \"tab_id\" from syscolumns where id IN (select id from sysobjects where name IN ("
+        query_fllow = ") and SUBTYPE$ = 'UTAB' and schid = (select id from sysobjects where name = :param_0"
+        query_fllow += " and TYPE$ = 'SCH') and info3 & 0x3F not in(0x05 ,0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27)) and info2 = 1;"
 
         result = self._run_batches(
             connection,
             all_objects,
             query,
             query_fllow,
-            dblink
+            dblink,
+            params
         )
 
         result_list = []
@@ -2509,15 +2528,14 @@ class DMDialect(default.DefaultDialect):
             tab_col_list[str(row_dict['tab_id'])] = row_dict['col_name']
         if len(table_id_list) == 0:
             return result_list
-        query = "SELECT id, name, info6 FROM SYSOBJECTS WHERE ID IN ( "
+        query = "SELECT id as \"id\", name as \"name\", info6 as \"info6\" FROM SYSOBJECTS WHERE ID IN ( "
         query_fllow = ");"
         info6 = self._run_batches(
             connection,
             table_id_list,
             query,
             query_fllow,
-            dblink,
-            False
+            dblink
         )
 
         for row_dict in info6:
@@ -2542,6 +2560,9 @@ class DMDialect(default.DefaultDialect):
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
 
+        params = {}
+        params["param_0"] = owner
+
         json_query = "SELECT sysobj.name as table_name, syscol.name as col_name,\n"\
                     "CASE syscol.scale\n"\
 	                "   WHEN 0x4000 THEN 'JSONB'\n"\
@@ -2550,7 +2571,7 @@ class DMDialect(default.DefaultDialect):
                     "FROM SYSOBJECTS sysobj, SYSCOLUMNS syscol\n"\
                     "WHERE sysobj.name IN ("
         json_query_fllow = ")AND sysobj.SUBTYPE$ = 'UTAB'\n"\
-                            "AND sysobj.schid = (SELECT ID FROM SYSOBJECTS WHERE NAME =  \'" + str(owner) +"\' AND TYPE$ = 'SCH')\n"\
+                            "AND sysobj.schid = (SELECT ID FROM SYSOBJECTS WHERE NAME = :param_0 AND TYPE$ = 'SCH')\n"\
                             "AND syscol.id = sysobj.id\n"\
                             "AND LOWER(syscol.type$) = 'blob'"\
                             "AND syscol.scale IN (16384, 8192);"
@@ -2560,7 +2581,8 @@ class DMDialect(default.DefaultDialect):
             all_objects,
             json_query,
             json_query_fllow,
-            dblink
+            dblink,
+            params
         )
 
         json_list = []
@@ -2570,17 +2592,15 @@ class DMDialect(default.DefaultDialect):
                      "data_type" : row_dict["data_type"]}
             json_list.append(cdict)
 
-        query = "SELECT a_tab_cols.table_name, a_tab_cols.column_name, a_tab_cols.data_type,\n"\
-                    "a_tab_cols.char_length, a_tab_cols.data_precision, a_tab_cols.data_scale,\n"\
-                    "a_tab_cols.nullable, a_tab_cols.data_default, a_col_comments.comments, a_tab_cols.virtual_column\n"\
+        query = "SELECT a_tab_cols.table_name as \"table_name\", a_tab_cols.column_name as \"column_name\", a_tab_cols.data_type as \"data_type\",\n"\
+                    "a_tab_cols.char_length as \"char_length\", a_tab_cols.data_precision as \"data_precision\", a_tab_cols.data_scale as \"data_scale\",\n"\
+                    "a_tab_cols.nullable as \"nullable\", a_tab_cols.data_default as \"data_default\", a_col_comments.comments as \"comments\", a_tab_cols.virtual_column as \"virtual_column\"\n"\
                     "FROM all_tab_cols a_tab_cols, all_col_comments a_col_comments \n"\
                     "WHERE a_tab_cols.table_name = a_col_comments.table_name\n"\
                     "AND a_tab_cols.column_name = a_col_comments.column_name\n"\
                     "AND a_tab_cols.owner = a_col_comments.schema_name\n"\
-                    "AND a_tab_cols.hidden_column = \'NO\'\n"\
-                    "AND a_tab_cols.owner = \'"
-        query += str(owner)
-        query += "\' AND a_tab_cols.table_name IN("
+                    "AND a_tab_cols.hidden_column = 'NO'\n"\
+                    "AND a_tab_cols.owner = :param_0 AND a_tab_cols.table_name IN("
 
         query_fllow = ")\nORDER BY a_tab_cols.table_name, a_tab_cols.column_id;"
 
@@ -2591,7 +2611,8 @@ class DMDialect(default.DefaultDialect):
             all_objects,
             query,
             query_fllow,
-            dblink
+            dblink,
+            params=params
         )
 
         identity = self.get_identity_info(connection, owner, all_objects, dblink)
@@ -2618,6 +2639,8 @@ class DMDialect(default.DefaultDialect):
                     coltype = NUMBER(precision, scale)
             elif coltype in ('VARCHAR', 'VARCHAR2', 'NVARCHAR2', 'CHAR', 'CHARACTER'):
                 coltype = self.ischema_names.get(coltype)(length)
+            elif coltype in ('INTEGER', 'INT'):
+                coltype = sqltypes.Integer
             elif 'WITH TIME ZONE' in coltype:
                 coltype = TIMESTAMP(timezone = True)
             else:
@@ -2673,31 +2696,33 @@ class DMDialect(default.DefaultDialect):
 
         schema = self.denormalize_name(schema or self.default_schema_name)
 
+        params = {}
+        param_count = 1
+        comment_sql = "SELECT table_name, comments FROM \n"
+
         if schema.upper() == self.default_schema_name.upper():
-            COMMENT_SQL = """
-                        SELECT table_name, comments
-                        FROM user_tab_comments
-                        WHERE table_name IN(
-                        """
-            if (len(all_objects) > 0):
-                COMMENT_SQL += "\'" + all_objects[0] + "\'"
-                if(len(all_objects) > 1):
-                    for i in range(len(all_objects) - 1):
-                        COMMENT_SQL += ",\'" + all_objects[i+1] + "\'"
-            COMMENT_SQL += ")"
+            comment_sql += "user_tab_comments"
         else:
-            COMMENT_SQL = "SELECT table_name, comments"\
-                    "\nFROM all_tab_comments"\
-                    "\nWHERE owner = "+"\'"+schema + "\'"\
-                    "AND table_name IN("
-            if (len(all_objects)>0):
-                COMMENT_SQL += "\'" + all_objects[0] + "\'"
-                if(len(all_objects)>1):
-                    for i in range(len(all_objects) - 1):
-                        COMMENT_SQL += ",\'" + all_objects[i+1] + "\'"
-            COMMENT_SQL += ")"
+            comment_sql += "all_tab_comments"
+
+        if (len(all_objects) > 0):
+            comment_sql += " WHERE table_name IN(:param_0"
+            params['param_0'] = all_objects[0]
+            if (len(all_objects) > 1):
+                for i in range(len(all_objects) - 1):
+                    param_name = 'param_' + str(param_count)
+                    param_count = param_count + 1
+                    comment_sql += ", :" + param_name
+                    params[param_name] = all_objects[i+1]
+        comment_sql += ")"
+
+        if schema.upper() != self.default_schema_name.upper():
+            param_name = 'param_' + str(param_count)
+            comment_sql += "\nAND owner = " + ":" + param_name
+            params[param_name] = schema
+
         default = ReflectionDefaults.table_comment
-        result = connection.execute(sql.text(COMMENT_SQL))
+        result = connection.execute(sql.text(comment_sql), parameters=params)
         ignore_mat_view = "snapshot table for snapshot "
         a=(
             (
@@ -2734,20 +2759,14 @@ class DMDialect(default.DefaultDialect):
         )
 
         schema = self.denormalize_name(schema or self.default_schema_name)
+
+        comment_sql = "SELECT comments FROM "
         if schema.upper() == self.default_schema_name.upper():
-            COMMENT_SQL = """
-                        SELECT comments
-                        FROM user_tab_comments
-                        WHERE table_name = :table_name
-                        """
-            result = connection.execute(sql.text(COMMENT_SQL).bindparams(table_name=table_name))
+            comment_sql += "user_tab_comments WHERE table_name = :table_name"
+            result = connection.execute(sql.text(comment_sql).bindparams(table_name=table_name))
         else:
-            COMMENT_SQL = """
-                    SELECT comments
-                    FROM all_tab_comments
-                    WHERE table_name = :table_name AND owner = :schema_name
-                    """
-            result = connection.execute(sql.text(COMMENT_SQL).bindparams(table_name=table_name, schema_name=schema))
+            comment_sql += "all_tab_comments WHERE table_name = :table_name AND owner = :schema_name"
+            result = connection.execute(sql.text(comment_sql).bindparams(table_name=table_name, schema_name=schema))
 
         get_table_flag = False
 
@@ -2764,39 +2783,22 @@ class DMDialect(default.DefaultDialect):
 
         return {"text": comment_str}
 
+    @reflection.cache
     def _get_indexes_rows(self, connection, schema, filter_names, scope, dblink=None, **kw):
         if type(filter_names) == str:
             filter_names = [filter_names]
 
         schema = self.denormalize_name(schema or self.default_schema_name)
-        if schema !=None and schema.upper() ==self.default_schema_name.upper():
+        if schema is not None and schema.upper() == self.default_schema_name.upper():
             flag = True
         else:
-            flag =False
-        query = "SELECT a.table_name AS table_name, a.index_name, a.column_name,\nb.index_type, b.uniqueness, b.compression, b.prefix_length "
+            flag = False
 
-        if flag == True:
-            query += "\n FROM USER_IND_COLUMNS%(dblink)s a,"\
-                "\nUSER_INDEXES%(dblink)s b  "
-        else:
-            query +="\nFROM ALL_IND_COLUMNS%(dblink)s a, "\
-                "\nALL_INDEXES%(dblink)s b "
-
-        query += "\nWHERE "\
-            "\na.index_name = b.index_name "
-
-        if flag == True:
-            query += "\nAND b.table_owner =  " + "'" + schema + "' "
-        else:
-            query += "\nAND a.table_owner = b.table_owner "
-
-        query += "\nAND a.table_name = b.table_name "
-        if schema is not None:
-            if schema.upper() !=self.default_schema_name.upper():
-                query += "AND a.table_owner =  "+"'"+schema+"' "
-        query += "\nAND a.table_name IN("
-
-        query_fllow = ")\nORDER BY a.index_name, a.column_position"
+        params = {}
+        params["param_0"] = schema
+        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", column_name as \"column_name\" "
+                    "FROM ALL_IND_COLUMNS WHERE TABLE_OWNER = :param_0 AND TABLE_NAME IN (")
+        query_fllow = ") ORDER BY index_name"
 
         if filter_names == None:
             all_objects = self._get_all_objects(connection, schema, scope, None, filter_names, dblink, **kw)
@@ -2808,23 +2810,58 @@ class DMDialect(default.DefaultDialect):
         else:
             query = query % {'dblink': ''}
 
+        col_result = self._run_batches(
+            connection,
+            all_objects,
+            query,
+            query_fllow,
+            dblink,
+            params
+        )
+
+        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", index_type as \"index_type\", "
+                "uniqueness as \"uniqueness\",  compression as \"compression\", prefix_length as \"prefix_length\", '' as \"column_name\"\n")
+        if flag:
+            query += "FROM USER_INDEXES WHERE TABLE_OWNER = :param_0 AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME IN ("
+        else:
+            query += "FROM ALL_INDEXES WHERE TABLE_OWNER = :param_0 AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME IN ("
+
+        if dblink != None:
+            query = query % {'dblink': dblink}
+        else:
+            query = query % {'dblink': ''}
+
+        index_result = self._run_batches(
+            connection,
+            all_objects,
+            query,
+            query_fllow,
+            dblink,
+            params
+        )
+
+        for col_dict in col_result:
+            for ind_dict in index_result:
+                if (col_dict["table_name"] == ind_dict["table_name"] and col_dict["index_name"] == ind_dict[
+                    "index_name"] and col_dict["table_owner"] == ind_dict["table_owner"]):
+                    col_dict._key_to_index["index_type"] = 4
+                    col_dict._data = col_dict._data + (ind_dict._data[3],)
+                    col_dict._key_to_index["uniqueness"] = 5
+                    col_dict._data = col_dict._data + (ind_dict._data[4],)
+                    col_dict._key_to_index["compression"] = 6
+                    col_dict._data = col_dict._data + (ind_dict._data[5],)
+                    col_dict._key_to_index["prefix_length"] = 7
+                    col_dict._data = col_dict._data + (ind_dict._data[6],)
+
         pks = {
             row_dict["cons_name"]
             for row_dict in self.get_multi_constraint_data(connection, schema, filter_names, scope, None, dblink)
             if row_dict["constraint_type"] == "P"
         }
 
-        result = self._run_batches(
-            connection,
-            all_objects,
-            query,
-            query_fllow,
-            dblink
-        )
-
         return [
             row_dict
-            for row_dict in result
+            for row_dict in col_result
             if row_dict["index_name"] not in pks
         ]
 
@@ -2886,98 +2923,72 @@ class DMDialect(default.DefaultDialect):
         )
 
     @reflection.cache
-    def get_indexes(self, connection, table_name, schema=None,
-                    resolve_synonyms=False, dblink='', **kw):
+    def get_indexes(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_indexes', 
-                           connection, table_name, schema,
-                           resolve_synonyms, dblink, **kw)
+                           connection, table_name, schema, **kw)
 
         info_cache = kw.get('info_cache')
-        (table_name, schema, dblink, synonym) = \
-            self._prepare_reflection_args(connection, table_name, schema,
-                                          resolve_synonyms, dblink,
-                                          info_cache=info_cache)
+        (table_name, schema, dblink, synonym) = self._prepare_reflection_args(connection, table_name, schema, info_cache=info_cache)
         self.get_whether_exists_table(connection, table_name, schema)
-        indexes = []
 
-        params = {'table_name': table_name}
+        params = {'table_name': table_name, 'schema': schema}
         if schema !=None and schema.upper() ==self.default_schema_name.upper():
             flag = True
         else:
             flag =False
-        text = \
-            "SELECT a.index_name, a.column_name, "\
-            "\nb.index_type, b.uniqueness, b.compression, b.prefix_length "
 
-        if flag == True:
-            text += "\n FROM USER_IND_COLUMNS%(dblink)s a,"\
-                "\nUSER_INDEXES%(dblink)s b  "
+        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", column_name as \"column_name\" "
+                    "FROM ALL_IND_COLUMNS%(dblink)s WHERE TABLE_OWNER = :schema AND TABLE_NAME = :table_name ORDER BY index_name")
+
+        if dblink != None:
+            query = query % {'dblink': dblink}
         else:
-            text +="\nFROM ALL_IND_COLUMNS%(dblink)s a, "\
-                "\nALL_INDEXES%(dblink)s b "
+            query = query % {'dblink': ''}
 
-        text += "\nWHERE "\
-            "\na.index_name = b.index_name "
+        col_result = connection.execute(sql.text(query), parameters=params)
 
-        if flag == True:
-            text += "\nAND b.table_owner =  " + "'" + schema + "' "
+        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", index_type as \"index_type\",\n"
+                "uniqueness as \"uniqueness\", compression as \"compression\", prefix_length as \"prefix_length\"\n")
+        if flag:
+            query += "FROM USER_INDEXES WHERE TABLE_OWNER = :schema AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME = :table_name ORDER BY index_name"
         else:
-            text += "\nAND a.table_owner = b.table_owner "
+            query += "FROM ALL_INDEXES WHERE TABLE_OWNER = :schema AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME = :table_name ORDER BY index_name"
 
-        text += "\nAND a.table_name = b.table_name "\
-            "\nAND a.table_name =  "+"'"+table_name+"' "
+        if dblink != None:
+            query = query % {'dblink': dblink}
+        else:
+            query = query % {'dblink': ''}
 
-        if flag == False and schema is not None:
-            params['schema'] = schema
-            text += "AND a.table_owner =  "+"'"+schema+"' "
+        index_result = connection.execute(sql.text(query), parameters=params)
 
-        text += "ORDER BY a.index_name, a.column_position"
-
-        text = text % {'dblink': dblink}
-
-        q = sql.text(text)
-        rp = connection.execute(q)
         indexes = []
-        last_index_name = None
-        pk_constraint = self.get_pk_constraint(
-            connection, table_name, schema, resolve_synonyms=resolve_synonyms,
-            dblink=dblink, info_cache=kw.get('info_cache'))
-        pkeys = pk_constraint['constrained_columns']
         uniqueness = dict(NONUNIQUE=False, UNIQUE=True)
         enabled = dict(DISABLED=False, ENABLED=True)
 
-        dm_sys_col = re.compile(r'SYS_NC\d+\$', re.IGNORECASE)
+        index_dict = []
+        column_dict = []
 
-        def upper_name_set(names):
-            return set([i.upper() for i in names])
+        for ind_row in index_result:
+            index_dict.append(ind_row)
 
-        pk_names = upper_name_set(pkeys)
+        for col_row in col_result:
+            column_dict.append(col_row)
 
-        def remove_if_primary_key(index):
-            
-            # don't include the primary key index
-            if index is not None and \
-               upper_name_set(index['column_names']) == pk_names:
-                indexes.pop()
-
-        index = None
-        for rset in rp:
-            if rset.index_name != last_index_name:
-                remove_if_primary_key(index)
-                index = dict(name=self.normalize_name(rset.index_name),
-                             column_names=[], dialect_options={})
-                indexes.append(index)
-            index['unique'] = uniqueness.get(rset.uniqueness, False)
-
-            if rset.index_type in ('BITMAP', 'FUNCTION-BASED BITMAP'):
+        for ind_dict in index_dict:
+            index = dict(name=self.normalize_name(ind_dict.index_name),
+                         column_names=[], dialect_options={})
+            indexes.append(index)
+            index['unique'] = uniqueness.get(ind_dict.uniqueness, False)
+            if ind_dict.index_type in ('BITMAP', 'FUNCTION-BASED BITMAP'):
                 index['dialect_options']['dm_bitmap'] = True
-            if enabled.get(rset.compression, False):
-                index['dialect_options']['dm_compress'] = rset.prefix_length
+            if enabled.get(ind_dict.compression, False):
+                index['dialect_options']['dm_compress'] = ind_dict.prefix_length
 
-            if not dm_sys_col.match(rset.column_name):
-                index['column_names'].append(self.normalize_name(rset.column_name))
-            last_index_name = rset.index_name
-        remove_if_primary_key(index)
+            for col_dict in column_dict:
+                if col_dict.table_owner == ind_dict.table_owner and col_dict.table_name == ind_dict.table_name and col_dict.index_name == ind_dict.index_name:
+                    index['column_names'].append(self.normalize_name(col_dict.column_name))
+                    del col_dict
+
         return indexes
 
     @cache_with_list_decorator
@@ -2986,23 +2997,25 @@ class DMDialect(default.DefaultDialect):
             filter_names = [filter_names]
         schema = self.denormalize_name(schema or self.default_schema_name)
         query = "SELECT" \
-                "\nac.constraint_name AS cons_name," \
-                "\nac.table_name AS table_name,"\
-                "\nac.constraint_type AS constraint_type," \
-                "\nloc.column_name AS local_column," \
-                "\nrem.table_name AS remote_table," \
-                "\nrem.column_name AS remote_column," \
-                "\nrem.owner AS remote_owner," \
-                "\nloc.position as loc_pos," \
-                "\nrem.position as rem_pos,"\
-                "\nac.delete_rule as delete_rule"\
+                "\nac.constraint_name AS \"cons_name\"," \
+                "\nac.table_name AS \"table_name\","\
+                "\nac.constraint_type AS \"constraint_type\"," \
+                "\nloc.column_name AS \"local_column\"," \
+                "\nrem.table_name AS \"remote_table\"," \
+                "\nrem.column_name AS \"remote_column\"," \
+                "\nrem.owner AS \"remote_owner\"," \
+                "\nloc.position as \"loc_pos\"," \
+                "\nrem.position as \"rem_pos\","\
+                "\nac.delete_rule as \"delete_rule\""\
 
+        params = {}
+        params["param_0"] = schema
         if schema == self.denormalize_name(self.default_schema_name):
             query += "\nFROM user_constraints%(dblink)s ac," + "\nuser_cons_columns%(dblink)s loc," + "\nuser_cons_columns%(dblink)s rem"\
                      "\nWHERE "
         else:
             query += "\nFROM all_constraints%(dblink)s ac," + "\nall_cons_columns%(dblink)s loc," + "\nall_cons_columns%(dblink)s rem"\
-                     "\nWHERE ac.owner = \'" + schema + "\' \nAND "
+                     "\nWHERE ac.owner = :param_0 \nAND "
 
         query += "ac.table_name IN("
         if dblink != None:
@@ -3028,7 +3041,8 @@ class DMDialect(default.DefaultDialect):
             all_objects,
             query,
             query_fllow,
-            dblink
+            dblink,
+            params
         ))
         return result
 
@@ -3039,15 +3053,15 @@ class DMDialect(default.DefaultDialect):
 
         text = \
             "SELECT"\
-            "\nac.constraint_name,"\
-            "\nac.constraint_type,"\
-            "\nloc.column_name AS local_column,"\
-            "\nrem.table_name AS remote_table,"\
-            "\nrem.column_name AS remote_column,"\
-            "\nrem.owner AS remote_owner,"\
-            "\nloc.position as loc_pos,"\
-            "\nrem.position as rem_pos,"\
-            "\nac.delete_rule as delete_rule"
+            "\nac.constraint_name as \"constraint_name\","\
+            "\nac.constraint_type as \"constraint_type\","\
+            "\nloc.column_name AS \"local_column\","\
+            "\nrem.table_name AS \"remote_table\","\
+            "\nrem.column_name AS \"remote_column\","\
+            "\nrem.owner AS \"remote_owner\","\
+            "\nloc.position as \"loc_pos\","\
+            "\nrem.position as \"rem_pos\","\
+            "\nac.delete_rule as \"delete_rule\""
 
         schema = self.denormalize_name(schema or self.default_schema_name)
 
@@ -3056,13 +3070,13 @@ class DMDialect(default.DefaultDialect):
                     "\nWHERE "
         else:
             text += "\nFROM all_constraints%(dblink)s ac," + "\nall_cons_columns%(dblink)s loc," + "\nall_cons_columns%(dblink)s rem"\
-                    "\nWHERE ac.owner = \'" + schema + "\' \nAND "
+                    "\nWHERE ac.owner = :schema \nAND "
 
-        text += "ac.table_name = "+"'"+table_name+"' "\
+        text += "ac.table_name = :table_name"\
                 "\nAND ac.constraint_type IN ('R','P','U')"
 
         if schema is not None:
-            text += "\nAND ac.owner = "+"'"+schema+"' "
+            text += "\nAND ac.owner = :schema"
 
         text += \
             "\nAND ac.owner = loc.owner"\
@@ -3073,7 +3087,7 @@ class DMDialect(default.DefaultDialect):
             "\nORDER BY ac.constraint_name, loc.position"
 
         text = text % {'dblink': dblink}
-        rp = connection.execute(sql.text(text))
+        rp = connection.execute(sql.text(text).bindparams(schema=schema, table_name=table_name))
         constraint_data = rp.fetchall()
         return constraint_data
     
@@ -3395,9 +3409,8 @@ class DMDialect(default.DefaultDialect):
     ):
         schema = self.denormalize_name(schema or self.default_schema_name)
 
-        text = "SELECT a_mviews.mview_name FROM all_mviews a_mviews WHERE schid = (select id from sysobjects where name = \'%(schema)s\' and type$ = 'SCH');"
-        text = text % {'schema': schema}
-        rp = connection.execute(sql.text(text))
+        text = "SELECT a_mviews.mview_name FROM all_mviews a_mviews WHERE schid = (select id from sysobjects where name = :schema and type$ = 'SCH');"
+        rp = connection.execute(sql.text(text).bindparams(schema=schema))
         mat_view_names = rp.fetchall()
 
         if _normalize:
@@ -3425,18 +3438,16 @@ class DMDialect(default.DefaultDialect):
         second_error = None
 
         try:
-            text = "SELECT DBMS_METADATA.GET_DDL(\'VIEW\', \'%(name)s\' , \'%(owner)s\')"
-            text = text % {'name': name, 'owner': owner}
-            result1 = connection.execute(sql.text(text)).scalar()
+            text = "SELECT DBMS_METADATA.GET_DDL('VIEW', :name , :owner)"
+            result1 = connection.execute(sql.text(text).bindparams(name=name, owner=owner)).scalar()
         except Exception as e:
             first_error = e
             view_find_flag = False
 
         if not view_find_flag:
             try:
-                text = "SELECT DBMS_METADATA.GET_DDL(\'MATERIALIZED_VIEW\', \'%(name)s\' , \'%(owner)s\')"
-                text = text % {'name': name, 'owner': owner}
-                result2 = connection.execute(sql.text(text)).scalar()
+                text = "SELECT DBMS_METADATA.GET_DDL('MATERIALIZED_VIEW', :name , :owner)"
+                result2 = connection.execute(sql.text(text).bindparams(name=name, owner=owner)).scalar()
                 mview_find_flag = True
             except Exception as e:
                 second_error = e
@@ -3476,14 +3487,18 @@ class DMDialect(default.DefaultDialect):
                 "search_condition AS search_condition FROM ALL_CONSTRAINTS"\
                + dblink + " WHERE table_name IN( "
 
-        query_fllow = ") AND constraint_type = 'C' AND owner = \'" + owner + "\';"
+        query_fllow = ") AND constraint_type = 'C' AND owner = :param_0"
+
+        params = {}
+        params['param_0'] = owner
 
         run_result = self._run_batches(
             connection,
             all_objects,
             query,
             query_fllow,
-            dblink
+            dblink,
+            params
         )
 
         check_constraints = defaultdict(list)
@@ -3529,10 +3544,9 @@ class DMDialect(default.DefaultDialect):
 
         text = "SELECT constraint_name AS constraint_name, table_name AS table_name, "\
                 "search_condition AS search_condition FROM ALL_CONSTRAINTS"\
-               + dblink + " WHERE table_name = \'" + table_name + "\'  AND constraint_type = 'C' AND owner = \'"\
-                + schema + "\';"
+               + dblink + " WHERE table_name = :table_name AND constraint_type = 'C' AND owner = :schema;"
 
-        rp = connection.execute(sql.text(text))
+        rp = connection.execute(sql.text(text).bindparams(table_name=table_name, schema=schema))
         constraint_data = rp.fetchall()
 
         not_null = re.compile(r"..+?. IS NOT NULL$")
@@ -3583,3 +3597,284 @@ class _OuterJoinColumn(sql.ClauseElement):
 
     def __init__(self, column):
         self.column = column
+
+class dmSession(Session):
+    def execute(
+        self,
+        statement: Executable,
+        params: Optional[_CoreAnyExecuteParams] = None,
+        *,
+        execution_options: OrmExecuteOptionsParameter = util.EMPTY_DICT,
+        bind_arguments: Optional[_BindArguments] = None,
+        _parent_execute_state: Optional[Any] = None,
+        _add_event: Optional[Any] = None,
+    ) -> Result[Any]:
+
+        if self.bind.dialect.parse_stmt_func is not None and not isinstance(statement, TextClause):
+            if not isinstance(self, Session) and not isinstance(self, Connection):
+                raise ValueError("The db_session must be an instance object of Session or Connection of SQLAlchemy")
+
+            raw_sql, params = self.bind.dialect.parse_stmt_func(statement)
+
+            result = self.execute(text(raw_sql), params,  execution_options=execution_options, bind_arguments=bind_arguments, _parent_execute_state=_parent_execute_state, _add_event=_add_event)
+            return result
+        else:
+            return super().execute(
+                statement,
+                params,
+                execution_options=execution_options,
+                bind_arguments=bind_arguments,
+                _parent_execute_state=_parent_execute_state,
+                _add_event=_add_event,
+            )
+
+class dmsessionmaker(sessionmaker):
+
+    def __init__(
+        self,
+        bind: Optional[_SessionBind] = None,
+        *,
+        class_: Type[_S] = dmSession,  # type: ignore
+        autoflush: bool = True,
+        expire_on_commit: bool = True,
+        info: Optional[_InfoType] = None,
+        **kw: Any,
+    ):
+        super().__init__(bind, class_=class_, autoflush=autoflush, expire_on_commit=expire_on_commit, info=info, **kw)
+
+class DMDialect_Adapter:
+
+    autoincrement_str = " IDENTITY(1, 1)"
+    initial_quote = final_quote = '"'
+    escape_quote = '"'
+    escape_to_quote = '""'
+
+    def do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
+
+        if context.out_parameters != None and len(context.out_parameters) > 0:
+            dict_len = len(context.out_parameters)
+            poslist = []
+            for k in range(dict_len):
+                for j in range(columns):
+                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
+                        poslist.append(j)
+                        break
+            poslist, parameters = dialect.check_position(poslist, parameters)
+            result = cursor.executemany(statement, parameters)
+            for k in range(dict_len):
+                if result[poslist[k]] == [None]:
+                    context.out_parameters['ret_' + str(k)] = []
+                else:
+                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
+        else:
+            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table, "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
+            table_name = dialect.identifier_preparer.format_table(table_class)
+            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
+                primary_key_list = table_class.primary_key.c._all_columns
+                dict_len = len(primary_key_list)
+                statement = statement + ' RETURNING ' + table_name + '.' + dialect.do_normalize_name(
+                    dialect.identifier_preparer.format_column(primary_key_list[0]))
+            else:
+                statement = statement + ' RETURNING ' + table_name + '.ROWID'
+                dict_len = 1
+            for i in range(dict_len - 1):
+                statement = statement + ',' + table_name + '.' + dialect.do_normalize_name(dialect.identifier_preparer.format_column(primary_key_list[i + 1]))
+            statement = statement + ' INTO ?'
+            for i in range(dict_len - 1):
+                statement = statement + ', ?'
+            for i in range(rows):
+                for j in range(dict_len):
+                    parameters[i].append(None)
+            result = cursor.executemany(statement, parameters)
+            context.invoked_statement.table._update_true_table = None
+            context.inserted_primary_key_rows = []
+            if dict_len == 1:
+                temp_list = result[columns]
+                for j in range(len(temp_list)):
+                    context.inserted_primary_key_rows.append((temp_list[j],))
+            else:
+                for i in range(dict_len):
+                    context.inserted_primary_key_rows.append(tuple(result[columns + i]))
+
+    def async_do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
+
+        if context.out_parameters != None and len(context.out_parameters) > 0:
+            dict_len = len(context.out_parameters)
+            poslist = []
+            for k in range(dict_len):
+                for j in range(columns):
+                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
+                        poslist.append(j)
+                        break
+            poslist, parameters = dialect.check_position(poslist, parameters)
+            result = await_only(cursor.executemany(statement, parameters))
+            for k in range(dict_len):
+                if result[poslist[k]] == [None]:
+                    context.out_parameters['ret_' + str(k)] = []
+                else:
+                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
+        else:
+            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table,
+                                                                                        "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
+            table_name = dialect.identifier_preparer.format_table(table_class)
+            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
+                primary_key_list = table_class.primary_key.c._all_columns
+                dict_len = len(primary_key_list)
+                statement = statement + ' RETURNING ' + table_name + '.' + dialect.do_normalize_name(
+                    dialect.identifier_preparer.format_column(primary_key_list[0]))
+            else:
+                statement = statement + ' RETURNING ' + table_name + '.ROWID'
+                dict_len = 1
+            for i in range(dict_len - 1):
+                statement = statement + ',' + table_name + '.' + dialect.do_normalize_name(
+                    dialect.identifier_preparer.format_column(primary_key_list[i + 1]))
+            statement = statement + ' INTO ?'
+            for i in range(dict_len - 1):
+                statement = statement + ', ?'
+            for i in range(rows):
+                for j in range(dict_len):
+                    parameters[i].append(None)
+            await_only(cursor.executemany(statement, parameters))
+            context.invoked_statement.table._update_true_table = None
+
+    def limit_offset_clause(self, dialect, select, fetch_clause, fetch_clause_options, **kw):
+
+        text = ''
+
+        if select._offset_clause is not None:
+            offset_str = dialect.process(select._offset_clause, **kw)
+            text += "\n OFFSET %s ROWS" % offset_str
+
+        if fetch_clause is not None:
+            text += "\n FETCH FIRST %s%s ROWS %s" % (
+                dialect.process(fetch_clause, **kw),
+                " PERCENT" if fetch_clause_options["percent"] else "",
+                "WITH TIES" if fetch_clause_options["with_ties"] else "ONLY",
+            )
+
+        return text
+
+class DMMySQLDialect_Adapter:
+
+    autoincrement_str = " AUTO_INCREMENT"
+    initial_quote = final_quote = '`'
+    escape_quote = '`'
+    escape_to_quote = '``'
+
+    def do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
+        cursor.executemany(statement, parameters)
+
+    def async_do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
+        await_only(cursor.executemany(statement, parameters))
+
+    def limit_offset_clause(self, dialect, select, fetch_clause, fetch_clause_options, **kw):
+
+        text = ''
+
+        if fetch_clause is not None:
+            text += "\nLIMIT %s" % (
+                dialect.process(fetch_clause, **kw)
+            )
+
+        if select._offset_clause is not None:
+            if fetch_clause is None:
+                text += "\nLIMIT 9223372036854775807"
+            offset_str = dialect.process(select._offset_clause, **kw)
+            text += "\nOFFSET %s" % offset_str
+
+        return text
+
+class NoCompatible_Mode:
+
+    def json_proc_decorator(func):
+        def process(value):
+            if type(value) == dict or type(value) == list:
+                return str(value)
+            return value
+
+        return process
+
+class MySQLCompatible_Mode(NoCompatible_Mode):
+
+    def json_proc_decorator(func):
+        def process(value):
+            if type(value) == dict:
+                return value
+            else:
+                return json.loads(value)
+
+        return process
+
+class TSQLCompatible_Mode(NoCompatible_Mode):
+
+    pass
+
+class OracleCompatible_Mode(NoCompatible_Mode):
+
+    pass
+
+class Quote_Method:
+
+    def normalize_name(self, name):
+        return quoted_name(name, quote=True)
+
+    def denormalize_name(self, name):
+        return name
+
+    def quote_ident(self, ident):
+        return self.quote_identifier(ident)
+
+    def return_quote_str(self, ident):
+        return self.quote_identifier(ident)
+
+    def _self_process_name(self, name, reserved_words):
+        result_name = name
+        escape_quote = self.dialect.parse_module.escape_quote
+        escape_to_quote = self.dialect.parse_module.escape_to_quote
+        if escape_quote in result_name:
+            result_name = result_name.replace(escape_quote, escape_to_quote)
+        if self._double_percents:
+            result_name = result_name.replace("%", "%%")
+        result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
+
+        return result_name
+
+class No_Quote_Method:
+
+    def normalize_name(self, name):
+        if name.upper() == name and not \
+                self.identifier_preparer._requires_quotes(name.lower()):
+            return name.lower()
+        elif name.lower() == name:
+            return quoted_name(name, quote=True)
+        else:
+            return name
+
+    def denormalize_name(self, name):
+
+        if name.lower() == name and not \
+                self.identifier_preparer._requires_quotes(name.lower()):
+            name = name.upper()
+        return name
+
+    def quote_ident(self, ident):
+        if self._requires_quotes(ident):
+            return self.quote_identifier(ident)
+        else:
+            return ident
+
+    def return_quote_str(self, ident):
+        return ident
+
+    def _self_process_name(self, name, reserved_words):
+        result_name = name
+        escape_quote = self.dialect.parse_module.escape_quote
+        escape_to_quote = self.dialect.parse_module.escape_to_quote
+        if result_name.lower() in reserved_words or escape_quote in result_name or (result_name.upper() != result_name and result_name.lower() != result_name):
+            if escape_quote in result_name:
+                result_name = result_name.replace(escape_quote, escape_to_quote)
+            if self._double_percents:
+                result_name = result_name.replace("%", "%%")
+            result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
+
+        return result_name

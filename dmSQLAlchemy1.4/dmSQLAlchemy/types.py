@@ -272,7 +272,7 @@ class _DMLongVarchar(_LOBMixin, LONGVARCHAR):
     def get_dbapi_type(self, dbapi):
         return dbapi.LONG_STRING
 
-class _DMLongVarBinary(_LOBMixin, sqltypes.BLOB):
+class LONGVARBINARY(_LOBMixin, sqltypes.BLOB):
     __visit_name__ = 'LongVarBinary'
     def get_dbapi_type(self, dbapi):
         return dbapi.LOB 
@@ -442,7 +442,7 @@ ischema_names = {
     'BFILE': BFILE,
     'CLOB': CLOB,
     'NCLOB': NCLOB,
-    'TIME WITH TIME ZONE':TIME,
+    'TIME WITH TIME ZONE': TIME,
     'TIMESTAMP': TIMESTAMP,
     'TIMESTAMP WITH TIME ZONE': TIMESTAMP,
     'TIMESTAMP WITH LOCAL TIME ZONE': TIMESTAMP(local_timezone = True),
@@ -466,7 +466,7 @@ ischema_names = {
     'TEXT': _DMText,
     'INTEGER': _DMInteger,
     'INT': _DMInteger,
-    'BINARY':DMBINARY,
+    'BINARY': DMBINARY,
     'VARCHAR': VARCHAR,
     'DOUBLE': _DMDOUBLE,
     'DECIMAL': _DMDECIMAL,
@@ -483,4 +483,6 @@ ischema_names = {
     'ROWID': ROWID,
     'VARBINARY': VARBINARY,
     'IMAGE': IMAGE,
+    'LONGVARCHAR': LONGVARCHAR,
+    'LONGVARBINARY': LONGVARBINARY,
 }

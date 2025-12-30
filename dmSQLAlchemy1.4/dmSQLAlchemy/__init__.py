@@ -1,5 +1,6 @@
 from sqlalchemy.dialects import registry
 from . import base,dmPython,types
+from .base import dmsessionmaker, dmSession
 
 base.dialect = dmPython.dialect
 

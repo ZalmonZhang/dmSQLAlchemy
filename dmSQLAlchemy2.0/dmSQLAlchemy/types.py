@@ -5,6 +5,7 @@ from sqlalchemy import types as sqltypes
 from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
     BLOB, CLOB, DATE, TIME, TIMESTAMP, FLOAT, BIGINT, String, Interval, VARBINARY
 from .json import JSON, JSONPathType, JSONIndexType
+from .vector import VECTORTYPE, VECTOR, VectorAdaptor
 from sqlalchemy.engine import processors
 
 class NCLOB(sqltypes.Text):
@@ -56,6 +57,18 @@ class BFILE(sqltypes.LargeBinary):
     __visit_name__ = 'BFILE'
 
 class ARRAYCLOB(ARRAY):
+
+    def bind_processor(self, dialect):
+        def process(value):
+            if type(value) == list:
+                if len(value) == 0:
+                    result_string = ''
+                else:
+                    result_string = json.dumps(value)
+            return result_string
+
+        return process
+
     def result_processor(self, dialect, coltype):
         def to_list(val):
             if val is not None:
@@ -287,7 +300,7 @@ class _DMLongVarchar(_LOBMixin, LONGVARCHAR):
     def get_dbapi_type(self, dbapi):
         return dbapi.LONG_STRING
 
-class _DMLongVarBinary(_LOBMixin, sqltypes.BLOB):
+class LONGVARBINARY(_LOBMixin, sqltypes.BLOB):
     __visit_name__ = 'LongVarBinary'
     def get_dbapi_type(self, dbapi):
         return dbapi.LOB 
@@ -330,8 +343,12 @@ class _DMInteger(sqltypes.Integer):
     def result_processor(self, dialect, coltype):
         def to_int(val):
             if val is not None:
-                val = float(val)
-                val = int(val)
+                if isinstance(val, int):
+                    return val
+                else:
+                    from decimal import Decimal
+                    val = Decimal(val)
+                    val = int(val)
             return val
         return to_int
 
@@ -422,7 +439,7 @@ colspecs = {
 
 ischema_names = {
     'VARCHAR2': VARCHAR,
-    'VARCHAR':VARCHAR,
+    'VARCHAR': VARCHAR,
     'NVARCHAR2': NVARCHAR,
     'CHAR': CHAR,
     'DATE': DATE,
@@ -432,7 +449,7 @@ ischema_names = {
     'BFILE': BFILE,
     'CLOB': CLOB,
     'NCLOB': NCLOB,
-    'TIME WITH TIME ZONE':TIME,
+    'TIME WITH TIME ZONE': TIME,
     'TIMESTAMP': TIMESTAMP,
     'TIMESTAMP WITH TIME ZONE': TIMESTAMP,
     'TIMESTAMP WITH LOCAL TIME ZONE': TIMESTAMP(local_timezone = True),
@@ -456,20 +473,23 @@ ischema_names = {
     'TEXT': _DMText,
     'INTEGER': _DMInteger,
     'INT': _DMInteger,
-    'BINARY':DMBINARY,
-    'DOUBLE':_DMDOUBLE,
-    'DECIMAL':_DMDECIMAL,
-    'NUMERIC':_DMNumeric,
-    'DEC':_DMDECIMAL,
-    'REAL':_DMREAL,
-    'TINYINT':_DMSMALLINT,
-    'SMALLINT':_DMSMALLINT,
-    'BIGINT':_DMBIGINT,
-    'TIME':TIME,
+    'BINARY': DMBINARY,
+    'DOUBLE': _DMDOUBLE,
+    'DECIMAL': _DMDECIMAL,
+    'NUMERIC': _DMNumeric,
+    'DEC': _DMDECIMAL,
+    'REAL': _DMREAL,
+    'TINYINT': _DMSMALLINT,
+    'SMALLINT': _DMSMALLINT,
+    'BIGINT': _DMBIGINT,
+    'TIME': TIME,
     'JSON': JSON,
-    'JSONB' : JSON,
+    'JSONB': JSON,
     'CHARACTER': CHAR,
     'ROWID': ROWID,
     'VARBINARY': VARBINARY,
     'IMAGE': IMAGE,
+    'LONGVARCHAR': LONGVARCHAR,
+    'LONGVARBINARY': LONGVARBINARY,
+    'VECTOR': VECTOR,
 }

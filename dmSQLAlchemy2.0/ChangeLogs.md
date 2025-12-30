@@ -1,8 +1,31 @@
 # dmSQLAlchemy
 
-此包为Python的SQLAlchemy包连接达梦数据库的适配框架，当前版本为 `2.0.4` ，API详见安装目录下的 `《DM8_dmPython使用手册》` ，目前用于适配2.0及以上版本的SQLAlchemy。
+此包为Python的SQLAlchemy包连接达梦数据库的适配框架，当前版本为 `2.0.11` ，API详见安装目录下的 `《DM8_dmPython使用手册》` ，目前用于适配2.0及以上版本的SQLAlchemy。
 
 ## ChangeLogs
+
+#### dmSQLAlchemy v2.0.11(2025-10-21)
+
+* 修复了在dpc环境下由于lastrowid导致的插入失败情况
+* 改进了执行策略，当前将采用参数绑定的方式执行映射，执行效率将会提升
+
+#### dmSQLAlchemy v2.0.10(2025-09-20)
+
+* 新增了连接数据库时选择兼容模式选项
+* 修复了在MySQL语法解析模式下使用limit，offset选项报错的问题
+
+#### dmSQLAlchemy v2.0.9(2025-09-14)
+
+* 新增了MySQL语法解析模式下对于on duplicate update功能的支持
+
+#### dmSQLAlchemy v2.0.8(2025-8-18)
+
+* 新增了对于达梦数据库中向量类型的支持
+* 新增了在MySQL兼容模式下对于MySQL语法的兼容
+
+#### dmSQLAlchemy v2.0.7(2025-7-13)
+
+* 新增了对于SQLAlchemy异步功能的支持
 
 #### dmSQLAlchemy v2.0.6(2025-06-20)
 
