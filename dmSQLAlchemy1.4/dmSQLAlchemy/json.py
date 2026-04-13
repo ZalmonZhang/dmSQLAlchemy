@@ -1,8 +1,6 @@
 from __future__ import absolute_import
 
-import json
 from sqlalchemy import types as sqltypes
-from .globalvars import globalvars
 from sqlalchemy.sql import operators
 
 idx_precedence = operators._PRECEDENCE[operators.json_getitem_op]

@@ -1,16 +1,16 @@
 from sqlalchemy.dialects import registry
-from . import base, dmPython, types
+from . import base, dmpython, types
 from types import ModuleType
 import sqlalchemy
-from .base import dmsessionmaker, dmSession
+from .extensions import dmsessionmaker, dmSession
 current_version = sqlalchemy.__version__.split('b')[0].split('rc')[0].split('.post')[0].split('beta')[0]
 
 current_ver = list(map(int, current_version.split('.')))
 
 def get_async_info():
-    from . import dmAsync
+    from . import dmasync
     dm_async = type(
-        "dm_async", (ModuleType,), {"dialect": dmAsync.dialect_async}
+        "dm_async", (ModuleType,), {"dialect": dmasync.dialect_async}
     )
 
 if current_ver[0] > 2 and len(current_ver) == 3:
@@ -22,7 +22,7 @@ elif current_ver[0] == 2:
         if current_ver[2] > 22:
             get_async_info()
 
-base.dialect = dialect = dmPython.dialect
+base.dialect = dialect = dmpython.dialect
 
 from .types import \
     VARCHAR, NVARCHAR, CHAR, DATE, DATETIME, NUMBER,\
@@ -30,8 +30,6 @@ from .types import \
     FLOAT, DOUBLE_PRECISION, LONGVARCHAR, INTERVAL,\
     VARCHAR2, NVARCHAR2, ROWID, VECTOR, VectorAdaptor
 from .vector import VectorWordSeek, VectorImageSeek
-
-from .base import dialect
 
 __all__ = (
     'VARCHAR', 'NVARCHAR', 'CHAR', 'DATE', 'DATETIME', 'NUMBER',

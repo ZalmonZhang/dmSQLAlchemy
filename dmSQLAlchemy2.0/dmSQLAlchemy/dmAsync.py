@@ -5,22 +5,17 @@ import json
 import dmPython
 import functools
 import collections
-from typing import Type
-from sqlalchemy import sql
-from sqlalchemy import exc
-from sqlalchemy import pool
-from sqlalchemy.util import asbool
-from . import dmPython as _dmPython
-from sqlalchemy.engine import default
-from sqlalchemy.util import await_only
-from sqlalchemy.util import await_fallback
-from typing import Any, Union, Callable, Optional
-from .base import OracleCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, DMMySQLDialect_Adapter, Quote_Method
+from . import dmpython as _dmPython
+from sqlalchemy import sql, text, exc, pool, util
+from sqlalchemy.engine import default, reflection
+from typing import Any, Union, Callable, Optional, Type
+from sqlalchemy.util import await_only, asbool, await_fallback
+from .extensions import OracleCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, DMMySQLDialect_Adapter, Quote_Method
 from sqlalchemy.connectors.asyncio import AsyncAdapt_dbapi_connection, AsyncAdapt_dbapi_cursor, AsyncAdapt_dbapi_ss_cursor, AsyncAdaptFallback_dbapi_connection
 
 from . import __name__ as MODULE_NAME
 
-from .globalvars import globalvars
+from .extensions import globalvars
 
 Xid = collections.namedtuple(
     "Xid", ["format_id", "global_transaction_id", "branch_qualifier"]
@@ -552,7 +547,6 @@ class BaseCursor:
         self._impl.close()
         self._impl = None
 
-
     @property
     def fetchvars(self) -> list:
         self._verify_open()
@@ -934,12 +928,15 @@ class DMExecutionContext_dmasync(
     _dmPython.DMExecutionContext_dmPython
 ):
     def create_cursor(self):
-        cursor = self._dbapi_connection.raw.cursor()
+        cursor = self._dbapi_connection.cursor()
 
         if self.dialect.arraysize:
             cursor.arraysize = self.dialect.arraysize
 
         return cursor
+
+    def set_output_val(self, value):
+        self.cursor._cursor.raw.output_stream = value
 
 class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
     supports_statement_cache = True
@@ -982,11 +979,11 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
                     compatible_mode = cparams['compatible_mode'].upper()
                     del cparams['compatible_mode']
                     if compatible_mode == 'MYSQL':
-                        self.compatible_module = MySQLCompatible_Mode
+                        self.compatible_module = MySQLCompatible_Mode()
                     elif compatible_mode == 'TSQL':
-                        self.compatible_module = TSQLCompatible_Mode
+                        self.compatible_module = TSQLCompatible_Mode()
                     elif compatible_mode == 'ORACLE':
-                        self.compatible_module = OracleCompatible_Mode
+                        self.compatible_module = OracleCompatible_Mode()
                 else:
                     raise ValueError("The compatible_mode must be of string type and specified within the scope of DM, Oracle, MYSQL and TSQL")
 
@@ -995,12 +992,12 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
                 if type(parse_type) is str and parse_type.upper() in ['DM', 'MYSQL', 'TSQL']:
                     if parse_type.upper() == 'MYSQL':
                         if compatible_mode == None:
-                            self.compatible_module = MySQLCompatible_Mode
-                        self.parse_module = DMMySQLDialect_Adapter
+                            self.compatible_module = MySQLCompatible_Mode()
+                        self.parse_module = DMMySQLDialect_Adapter()
                         self.parse_stmt_func = _dmPython.parse_mysql_stmt
                     if parse_type.upper() == 'TSQL':
                         if compatible_mode == None:
-                            self.compatible_module = TSQLCompatible_Mode
+                            self.compatible_module = TSQLCompatible_Mode()
                         self.parse_stmt_func = _dmPython.parse_tsql_stmt
                 else:
                     raise ValueError("The parse_type must be of string type and specified within the scope of DM, MYSQL and TSQL")
@@ -1013,16 +1010,16 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
                 quote_type = cparams['add_quote_all']
                 if type(quote_type) is bool:
                     if quote_type is True:
-                        self.quote_module = Quote_Method
+                        self.quote_module = Quote_Method()
                     del cparams['add_quote_all']
                 else:
                     raise ValueError("The add_quote_all must be of bool type")
 
             dbapi_conn = self.dbapi.connect(*cargs, **cparams)
 
-            conn = dbapi_conn.driver_connection
+            conn = dbapi_conn
 
-            conn_raw = conn.raw
+            conn_raw = conn.driver_connection.raw
 
             self.encoding = self.get_conn_local_code(conn_raw)
 
@@ -1065,13 +1062,42 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
                     int(x) for x in m.group(1, 2, 3) if x is not None
                 )
         self.dmasync_ver = version
-        if (
-            self.dmasync_ver > (0, 0, 0)
-            and self.dmasync_ver < self._min_version
-        ):
+        if self.dmasync_ver > (0, 0, 0) and self.dmasync_ver < self._min_version:
             raise exc.InvalidRequestError(
                 f"dmasync version {self._min_version} and above are supported"
             )
+
+    @classmethod
+    def get_pool_class(cls, url) -> type:
+        async_fallback = url.query.get("async_fallback", False)
+
+        if util.asbool(async_fallback):
+            return pool.FallbackAsyncAdaptedQueuePool
+        else:
+            return pool.AsyncAdaptedQueuePool
+
+    def _get_default_schema_name(self, connection):
+        self.trace_process('DMDialectAsync_dmasync', '_get_default_schema_name', connection)
+        dbapi_conn = connection.connection.dbapi_connection.driver_connection.raw
+
+        if hasattr(dbapi_conn, 'current_schema') and dbapi_conn.current_schema is not None:
+            return self.normalize_name(dbapi_conn.current_schema)
+        else:
+            return self.normalize_name(connection.execute(sql.text('SELECT USER FROM DUAL')).scalar())
+
+    def _get_server_version_info(self, connection):
+        self.dbapi_conn = connection.connection.dbapi_connection
+        if self.async_connect is None:
+            self.async_connect = self.dbapi_conn
+        dbapi_conn = connection.connection.dbapi_connection
+        version = []
+        r = re.compile(r'[.\-]')
+        for n in r.split(dbapi_conn.version):
+            try:
+                version.append(int(n))
+            except ValueError:
+                version.append(n)
+        return tuple(version)
 
     def do_begin_twophase(self, connection, xid):
         conn_xis = connection.connection.xid(*xid)
@@ -1119,10 +1145,7 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
         dbapi_connection.close()
 
     def do_commit(self, dbapi_connection):
-        await_only(dbapi_connection.commit())
-
-    def do_rollback(self, dbapi_connection):
-        await_only(dbapi_connection.rollback())
+        dbapi_connection.commit()
 
     def get_isolation_level(self, dbapi_connection):
         try:
@@ -1142,18 +1165,31 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
         except:
             raise
 
+    @reflection.cache
+    def has_table(self, connection, table_name, schema = None, dblink = None, **kw):
+
+        name = self.denormalize_name(table_name),
+        schema_name = self.denormalize_name(schema or self.default_schema_name)
+        statement = """SELECT tables_and_views.table_name 
+                    FROM (SELECT a_tables.table_name AS table_name, a_tables.owner AS owner 
+                    FROM all_tables a_tables UNION ALL SELECT a_views.view_name AS table_name, a_views.owner AS owner 
+                    FROM all_views a_views) tables_and_views 
+                    WHERE tables_and_views.table_name = ? AND tables_and_views.owner = ?"""
+        cursor = self.dm_do_execute(connection.connection.connection.cursor(), statement, [name[0], schema_name])
+        result = cursor.fetchone() is not None
+        return result
+
     def set_isolation_level(self, dbapi_connection, level):
         try:
             if level == "AUTOCOMMIT":
-                dbapi_connection.autoCommit = True
+                dbapi_connection.autocommit = True
             else:
-                dbapi_connection.autoCommit = False
+                dbapi_connection.autocommit = False
                 dbapi_connection.rollback()
                 cursor = await_only(self.async_connect.cursor())
                 await_only(cursor.execute(f"SET SESSION CHARACTERISTICS AS ISOLATION LEVEL {level}"))
         except:
             raise
-
 
     def _check_max_identifier_length(self, connection):
         max_len = connection.connection.connection.max_identifier_length
@@ -1161,6 +1197,79 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
             return max_len
         else:
             return super()._check_max_identifier_length(connection)
+        
+    # For internal use only, with known parameters and no need for returning
+    def dm_do_execute(self, cursor, statement, parameters, context=None):
+        await_only(cursor.execute(statement, parameters))
+        if context != None:
+            context.cursor = cursor
+        return cursor
+
+    def do_execute(self, cursor, statement, parameters, context=None):
+        try:
+            if parameters != [] and parameters != None:
+                for i in range(len(parameters)):
+                    list_element = parameters[i]
+                    if type(list_element) == list:
+                        if len(list_element) == 0:
+                            result_string = ''
+                        else:
+                            result_string = json.dumps(list_element)
+                        list_element = result_string
+                        parameters[i] = list_element
+            version_info = globalvars.get_var('DMPYTHON_VERSION').split(".")
+            if int(version_info[0]) > 2 or (int(version_info[0]) == 2 and int(version_info[1]) > 5) or (
+                    int(version_info[0]) == 2 and int(version_info[1]) == 5 and int(version_info[2]) > 9):
+                if context != None:
+                    if context.out_parameters != None:
+                        if context.compiled is not None:
+                            if hasattr(context.compiled, '_dm_returning'):
+                                if context.compiled._dm_returning:
+                                    poslist, parameters = self.resort_output_params(parameters, context)
+                                    result = context.cursor._cursor.raw.execute(statement, parameters)
+                                    for i in range(len(context.out_parameters)):
+                                        if result[poslist[i]] == [None]:
+                                            context.out_parameters[f"ret_{i}"] = []
+                                        else:
+                                            context.out_parameters[f"ret_{i}"] = result[poslist[i]]
+                                    return
+            await_only(cursor.execute(statement, parameters))
+            if context != None:
+                context.cursor = cursor
+            return cursor
+        except Exception as error:
+            raise
+
+    def do_executemany(self, cursor, statement, parameters, context=None):
+        try:
+            if isinstance(parameters, tuple):
+                parameters = list(parameters)
+            import datetime
+            rows = len(parameters)
+            columns = len(parameters[0]) if parameters else 0
+            for i in range(rows):
+                for j in range(columns):
+                    if type(parameters[i][j]) == datetime.datetime:
+                        temp = parameters[i][j]
+                        str_temp = temp.strftime("%Y-%m-%d %H:%M:%S.%f %Z")
+                        if 'UTC' in str_temp:
+                            parameters[i][j] = str_temp.replace('UTC', '')
+                        else:
+                            parameters[i][j] = str_temp
+                    if type(parameters[i][j]) == list:
+                        list_element = parameters[i][j]
+                        if len(list_element) == 0:
+                            result_string = ''
+                        else:
+                            result_string = json.dumps(list_element)
+                        list_element = result_string
+                        parameters[i][j] = list_element
+            self.parse_module.async_do_executemany_return(columns, rows, self, cursor, statement, parameters, context)
+
+            if context is not None:
+                context.cursor = cursor
+        except Exception as error:
+            raise
 
 
 class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
@@ -1177,7 +1286,7 @@ class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
         self._cursor.outputtypehandler = value
 
     def var(self, *args, **kwargs):
-        return self._cursor.var(*args, **kwargs)
+        return self._cursor.raw.var(*args, **kwargs)
 
     def close(self):
         self._rows.clear()
@@ -1186,36 +1295,52 @@ class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
     def setinputsizes(self, *args: Any, **kwargs: Any) -> Any:
         return self._cursor.setinputsizes(*args, **kwargs)
 
-    def _aenter_cursor(self, cursor: AsyncCursor) -> AsyncCursor:
-        try:
-            return cursor.__enter__()
-        except Exception as error:
-            self._adapt_connection._handle_exception(error)
+    def _make_new_cursor(
+        self, connection
+    ):
+        return await_only(self._connection.cursor())
 
     async def _execute_async(self, operation, parameters):
 
         if parameters is None:
             result = self._cursor.execute(operation)
         else:
-            result = await self._cursor.execute(operation, parameters)
+            result = self._cursor.execute(operation, parameters)
 
-        if self._cursor.description and not self.server_side:
-            self._rows = collections.deque(await self._cursor.fetchall())
         return result
+
+    async def _async_soft_close(self):
+        return
 
     async def _executemany_async(
         self,
         operation,
         seq_of_parameters,
     ):
-        return await self._cursor.executemany(operation, seq_of_parameters)
+        return self._cursor.executemany(operation, seq_of_parameters)
+
+    def fetchall(self):
+        result = self._rows
+        if self._cursor.description and not self.server_side:
+            result = self._cursor.raw.fetchall()
+        retval = list(result)
+        self._rows.clear()
+        return retval
+
+    def fetchone(self) -> Optional[Any]:
+        result = self._rows
+        if self._cursor.description and not self.server_side:
+            result = self._cursor.raw.fetchone()
+        if result:
+            return result
+        else:
+            return None
 
     def __enter__(self):
         return self
 
     def __exit__(self, type_: Any, value: Any, traceback: Any) -> None:
         self.close()
-
 
 class AsyncAdapt_dmasync_ss_cursor(
     AsyncAdapt_dbapi_ss_cursor, AsyncAdapt_dmasync_cursor
@@ -1297,12 +1422,10 @@ class AsyncAdapt_dmasync_connection(AsyncAdapt_dbapi_connection):
     def tpc_rollback(self, *args: Any, **kwargs: Any) -> Any:
         return self.await_(self._connection.tpc_rollback(*args, **kwargs))
 
-
 class AsyncAdaptFallback_dmasync_connection(
     AsyncAdaptFallback_dbapi_connection, AsyncAdapt_dmasync_connection
 ):
     __slots__ = ()
-
 
 class DMAdaptDBAPI:
     def __init__(self, dmPython) -> None:
@@ -1345,7 +1468,7 @@ class DMExecutionContextAsync_dmasync(DMExecutionContext_dmasync):
         return c
 
     def create_cursor(self):
-        cursor = self._dbapi_connection.raw.cursor()
+        cursor = self._dbapi_connection.cursor()
 
         if self.dialect.arraysize:
             cursor.arraysize = self.dialect.arraysize
@@ -1362,11 +1485,10 @@ class DMExecutionContextAsync_dmasync(DMExecutionContext_dmasync):
                 statement = statement + ', '
             primary_columns_name = self._self_process_name(primary_columns[i].name, reserved_words)
             statement = statement + primary_columns_name
-        statement = statement + " from {} where rowid = {}".format(table_name, lastrowid)
+        statement = statement + " from {} where rowid = ?".format(table_name)
 
-        cursor = self.dialect.do_execute(self.cursor, statement, None, None)
-        result = cursor._impl.fetchone()
-        return result
+        self.dialect.dm_do_execute(self.cursor, statement, [lastrowid], None)
+        return self.cursor.fetchone()
 
 class DMDialectAsync_dmasync(DMDialect_dmAsync):
     supports_server_side_cursors = True
@@ -1392,97 +1514,6 @@ class DMDialectAsync_dmasync(DMDialect_dmAsync):
 
     def get_driver_connection(self, connection):
         return connection._connection
-
-    def _get_server_version_info(self, connection):
-        self.dbapi_conn = connection.connection.dbapi_connection
-        if self.async_connect is None:
-            self.async_connect = self.dbapi_conn
-        dbapi_conn = connection.connection.dbapi_connection
-        version = []
-        r = re.compile(r'[.\-]')
-        for n in r.split(dbapi_conn.version):
-            try:
-                version.append(int(n))
-            except ValueError:
-                version.append(n)
-        return tuple(version)
-
-    def _get_default_schema_name(self, connection):
-        self.trace_process('DMDialectAsync_dmasync', '_get_default_schema_name', connection)
-        dbapi_conn = connection.connection.dbapi_connection.raw
-
-        if hasattr(dbapi_conn, 'current_schema') and dbapi_conn.current_schema is not None:
-            return self.normalize_name(dbapi_conn.current_schema)
-        else:
-            return self.normalize_name(connection.execute(sql.text('SELECT USER FROM DUAL')).scalar())
-
-    def do_execute(self, cursor, statement, parameters, context=None):
-        try:
-            cursor = await_only(self.async_connect.cursor())
-            if parameters != [] and parameters != None:
-                for i in range(len(parameters)):
-                    list_element = parameters[i]
-                    if type(list_element) == list:
-                        if len(list_element) == 0:
-                            result_string = ''
-                        else:
-                            result_string = json.dumps(list_element)
-                        list_element = result_string
-                        parameters[i] = list_element
-            version_info = globalvars.get_var('DMPYTHON_VERSION').split(".")
-            if int(version_info[0]) > 2 or (int(version_info[0]) == 2 and int(version_info[1]) > 5) or (
-                    int(version_info[0]) == 2 and int(version_info[1]) == 5 and int(version_info[2]) > 9):
-                if context != None:
-                    if context.out_parameters != None:
-                        if context.compiled is not None:
-                            if hasattr(context.compiled, '_dm_returning'):
-                                if context.compiled._dm_returning:
-                                    poslist, parameters = self.resort_output_params(parameters, context)
-                                    result = context.cursor.execute(statement, parameters)
-                                    for i in range(len(context.out_parameters)):
-                                        if result[poslist[i]] == [None]:
-                                            context.out_parameters[f"ret_{i}"] = []
-                                        else:
-                                            context.out_parameters[f"ret_{i}"] = result[poslist[i]]
-                                    return
-            if context is not None:
-                context.cursor = cursor.raw
-            await_only(cursor.execute(statement, parameters))
-            return cursor
-        except Exception as error:
-            raise
-
-    def do_executemany(self, cursor, statement, parameters, context=None):
-        try:
-            cursor = await_only(self.async_connect.cursor())
-            if isinstance(parameters, tuple):
-                parameters = list(parameters)
-            import datetime
-            rows = len(parameters)
-            columns = len(parameters[0]) if parameters else 0
-            for i in range(rows):
-                for j in range(columns):
-                    if type(parameters[i][j]) == datetime.datetime:
-                        temp = parameters[i][j]
-                        str_temp = temp.strftime("%Y-%m-%d %H:%M:%S.%f %Z")
-                        if 'UTC' in str_temp:
-                            parameters[i][j] = str_temp.replace('UTC', '')
-                        else:
-                            parameters[i][j] = str_temp
-                    if type(parameters[i][j]) == list:
-                        list_element = parameters[i][j]
-                        if len(list_element) == 0:
-                            result_string = ''
-                        else:
-                            result_string = json.dumps(list_element)
-                        list_element = result_string
-                        parameters[i][j] = list_element
-            self.parse_module.async_do_executemany_return(self, columns, rows, self, cursor, statement, parameters, context)
-
-            if context is not None:
-                context.cursor = cursor.raw
-        except Exception as error:
-            raise
 
 dialect = DMDialect_dmAsync
 dialect_async = DMDialectAsync_dmasync

@@ -6,13 +6,12 @@ import random
 import decimal
 import ipaddress
 from . import base as dm
-from .globalvars import globalvars
 from sqlalchemy.exc import DBAPIError
 from importlib.metadata import version
-import sqlalchemy.engine.result as _result
 from sqlalchemy import types as sqltypes, util, exc
-from .base import DMCompiler, DMDialect, DMExecutionContext, DMDialect_Adapter, DMMySQLDialect_Adapter, Quote_Method, No_Quote_Method, \
-    NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, OracleCompatible_Mode
+from .base import DMCompiler, DMDialect, DMExecutionContext
+from .extensions import DMDialect_Adapter, DMMySQLDialect_Adapter, Quote_Method, No_Quote_Method, \
+    NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, OracleCompatible_Mode, globalvars
 from sqlalchemy.engine import cursor as _cursor
 from .types import _DMBinary, _DMBoolean, _DMChar, _DMDate, _DMEnum, \
      _DMInteger, _DMInterval, _DMLongVarchar, _DMNumeric, \
@@ -36,7 +35,6 @@ class DMCompiler_dmPython(DMCompiler):
         else:
             return DMCompiler.bindparam_string(self, name, **kw)
 
-    
 class DMExecutionContext_dmPython(DMExecutionContext):
     out_parameters = None
 
@@ -50,7 +48,7 @@ class DMExecutionContext_dmPython(DMExecutionContext):
             if hasattr(self.compiled, 'has_out_parameters') or hasattr(self.compiled, '_dm_returning'):
                 if self.compiled.has_out_parameters or self.compiled._dm_returning or self.executemany:
                     if self.support_stream:
-                        self.cursor.output_stream = 1
+                        self.set_output_val(1)
 
                     out_parameters = self.out_parameters
                     assert out_parameters is not None
@@ -90,6 +88,9 @@ class DMExecutionContext_dmPython(DMExecutionContext):
                                         index = (index - 1 + len(result))
                                 if (type(compiled_param) == dict):
                                     param[index] = out_parameters[name]
+
+    def set_output_val(self, value):
+        self.cursor.output_stream = value
 
     def pre_exec(self):
         self.dialect.trace_process('DMExecutionContext_dmPython', 'pre_exec')
@@ -181,9 +182,9 @@ class DMDialect_dmPython(DMDialect):
 
     # dmSession parse_type add_quote_all compatible_mode
     parse_stmt_func = None
-    parse_module = DMDialect_Adapter
-    quote_module = No_Quote_Method
-    compatible_module = NoCompatible_Mode
+    parse_module = DMDialect_Adapter()
+    quote_module = No_Quote_Method()
+    compatible_module = NoCompatible_Mode()
 
     driver = "dmPython"
 
@@ -307,11 +308,11 @@ class DMDialect_dmPython(DMDialect):
                     compatible_mode = cparams['compatible_mode'].upper()
                     del cparams['compatible_mode']
                     if compatible_mode == 'MYSQL':
-                        self.compatible_module = MySQLCompatible_Mode
+                        self.compatible_module = MySQLCompatible_Mode()
                     elif compatible_mode == 'TSQL':
-                        self.compatible_module = TSQLCompatible_Mode
+                        self.compatible_module = TSQLCompatible_Mode()
                     elif compatible_mode == 'ORACLE':
-                        self.compatible_module = OracleCompatible_Mode
+                        self.compatible_module = OracleCompatible_Mode()
                 else:
                     raise ValueError("The compatible_mode must be of string type and specified within the scope of DM, Oracle, MYSQL and TSQL")
 
@@ -320,12 +321,12 @@ class DMDialect_dmPython(DMDialect):
                 if type(parse_type) is str and parse_type.upper() in ['DM', 'MYSQL', 'TSQL']:
                     if parse_type.upper() == 'MYSQL':
                         if compatible_mode == None:
-                            self.compatible_module = MySQLCompatible_Mode
-                        self.parse_module = DMMySQLDialect_Adapter
+                            self.compatible_module = MySQLCompatible_Mode()
+                        self.parse_module = DMMySQLDialect_Adapter()
                         self.parse_stmt_func = parse_mysql_stmt
                     elif parse_type.upper() == 'TSQL':
                         if compatible_mode == None:
-                            self.compatible_module = TSQLCompatible_Mode
+                            self.compatible_module = TSQLCompatible_Mode()
                         self.parse_stmt_func = parse_tsql_stmt
                 else:
                     raise ValueError("The parse_type must be of string type and specified within the scope of DM, MYSQL and TSQL")
@@ -338,10 +339,15 @@ class DMDialect_dmPython(DMDialect):
                 quote_type = cparams['add_quote_all']
                 if type(quote_type) is bool:
                     if quote_type is True:
-                        self.quote_module = Quote_Method
+                        self.quote_module = Quote_Method()
                     del cparams['add_quote_all']
                 else:
                     raise ValueError("The add_quote_all must be of bool type")
+
+            if 'database' in cparams:
+                schema = cparams['database']
+                cparams['schema'] = schema
+                del cparams['database']
 
             conn = self.dbapi.connect(*cargs, **cparams)
             
@@ -570,8 +576,7 @@ class DMDialect_dmPython(DMDialect):
                     list_element = result_string
                     parameters[i][j] = list_element
 
-        self.parse_module.do_executemany_return(self, columns, rows, self, cursor, statement, parameters, context)
-
+        self.parse_module.do_executemany_return(columns, rows, self, cursor, statement, parameters, context)
 
     def do_normalize_name(self, name):
         if name is None:

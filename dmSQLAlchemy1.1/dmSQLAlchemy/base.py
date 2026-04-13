@@ -1,14 +1,10 @@
-import re, json
+import re
+from .types import NUMBER
 from datetime import datetime
-from .globalvars import globalvars
-from .types import NUMBER, _DMNumeric
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.orm.session import Session
+from .extensions import globalvars
 from .types import colspecs, ischema_names
-from sqlalchemy import util, sql, exc, text
+from sqlalchemy import util, sql, exc
 from sqlalchemy.engine.base import Connection
-from sqlalchemy.sql.elements import TextClause
-from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy.engine import default, reflection
 from sqlalchemy.sql import operators as sql_operators
 from sqlalchemy import types as sqltypes, schema as sa_schema
@@ -1256,7 +1252,7 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     
         return tuple([self.quote_identifier(i) for i in ids if i is not None])
 
-    def quote(self, ident, force=None) -> str:
+    def quote(self, ident, force=None):
         if force is not None:
             util.warn_deprecated(
                 "The IdentifierPreparer.quote.force parameter is "
@@ -1377,7 +1373,17 @@ class DMExecutionContext(default.DefaultExecutionContext):
         super(DMExecutionContext, self)._setup_ins_pk_from_implicit_returning(row)
 
     def _self_process_name(self, name, reserved_words):
-        return self.dialect.quote_module._self_process_name(self, name, reserved_words)
+        result_name = name
+        escape_quote = self.dialect.parse_module.escape_quote
+        if self.dialect.quote_module._need_quote(result_name, escape_quote, reserved_words):
+            escape_to_quote = self.dialect.parse_module.escape_to_quote
+            if escape_quote in result_name:
+                result_name = result_name.replace(escape_quote, escape_to_quote)
+            if self._double_percents:
+                result_name = result_name.replace("%", "%%")
+            result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
+
+        return result_name
 
     def _set_autoinc_col_from_lastrowid(self, table, autoinc_col, lastrowid):
         self.dialect.trace_process('DMExecutionContext', '_set_autoinc_col_from_lastrowid')
@@ -1562,7 +1568,7 @@ class DMDialect(default.DefaultDialect):
 
             param_count = len(params)
             if dblink and not dblink.startswith("@"):
-                dblink = f"@{dblink}"
+                dblink = "@" + str(dblink)
 
             execution_options = {
                 "_dm_dblink": dblink or "",
@@ -1586,8 +1592,8 @@ class DMDialect(default.DefaultDialect):
                 params[param_name] = object_name
 
             temp_query += query_fllow
-            result = connection.execute(sql.text(temp_query), **params, execution_options=execution_options)
-            yield from result
+            result = connection.execute(sql.text(temp_query), params, execution_options=execution_options)
+            return result
 
     def get_whether_exists_table(self, connection, table_name, schema):
         query = "SELECT a_objects.object_name, a_objects.object_type\n"\
@@ -1600,8 +1606,8 @@ class DMDialect(default.DefaultDialect):
 
         if result is None:
             raise exc.NoSuchTableError(
-                f"{schema}.{table_name}" if schema else table_name
-            ) from None
+                str(schema) + "." + str(table_name) if schema else table_name
+            )
         else:
             return
 
@@ -1873,8 +1879,8 @@ class DMDialect(default.DefaultDialect):
 
         if get_table_flag is False:
             raise exc.NoSuchTableError(
-                f"{schema}.{table_name}" if schema else table_name
-            ) from None
+                str(schema) + "." + str(table_name) if schema else table_name
+            )
 
         return options
 
@@ -1977,10 +1983,10 @@ class DMDialect(default.DefaultDialect):
 
             columns.append(cdict)
 
-        if columns == []:
+        if columns is []:
             raise exc.NoSuchTableError(
-                f"{schema}.{table_name}" if schema else table_name
-            ) from None
+                str(schema) + "." + str(table_name) if schema else table_name
+            )
 
         return columns
 
@@ -2346,140 +2352,3 @@ class _OuterJoinColumn(sql.ClauseElement):
 
     def __init__(self, column):
         self.column = column
-
-class dmSession(Session):
-    def execute(self, clause, params=None, mapper=None, bind=None, **kw):
-
-        if self.bind.dialect.parse_stmt_func is not None and not isinstance(clause, TextClause):
-            compile_stmt = None
-            if not isinstance(self, Session) and not isinstance(self, Connection):
-                raise ValueError("The db_session must be an instance object of Session or Connection of SQLAlchemy")
-
-            raw_sql, params = self.bind.dialect.parse_stmt_func(clause)
-
-            result = self.execute(clause=text(raw_sql), params=params, mapper=mapper, bind=bind, **kw)
-            return result
-        else:
-            return super().execute(clause=clause, params=params, mapper=mapper, bind=bind, **kw)
-
-class dmsessionmaker(sessionmaker):
-
-    def __init__(
-        self,
-        bind=None,
-        class_=Session,
-        autoflush=True,
-        autocommit=False,
-        expire_on_commit=True,
-        info=None,
-        **kw
-    ):
-        super().__init__(bind, class_=class_, autoflush=autoflush, autocommit=autocommit, expire_on_commit=expire_on_commit, info=info, **kw)
-
-class DMDialect_Adapter:
-
-    autoincrement_str = " IDENTITY(1, 1)"
-    initial_quote = final_quote = '"'
-    escape_quote = '"'
-    escape_to_quote = '""'
-
-class DMMySQLDialect_Adapter:
-
-    autoincrement_str = " AUTO_INCREMENT"
-    initial_quote = final_quote = '`'
-    escape_quote = '`'
-    escape_to_quote = '``'
-
-class NoCompatible_Mode:
-
-    def json_proc_decorator(func):
-        def process(value):
-            if type(value) == dict or type(value) == list:
-                return str(value)
-            return value
-
-        return process
-
-class MySQLCompatible_Mode(NoCompatible_Mode):
-
-    def json_proc_decorator(func):
-        def process(value):
-            if type(value) == dict:
-                return value
-            else:
-                return json.loads(value)
-
-        return process
-
-class TSQLCompatible_Mode(NoCompatible_Mode):
-
-    pass
-
-class OracleCompatible_Mode(NoCompatible_Mode):
-
-    pass
-
-class Quote_Method:
-
-    def normalize_name(self, name):
-        return quoted_name(name, quote=True)
-
-    def denormalize_name(self, name):
-        if util.py2k:
-            name = unicode(name)
-        return name
-
-    def quote_ident(self, ident):
-        return self.quote_identifier(ident)
-
-    def return_quote_str(self, ident):
-        return self.quote_identifier(ident)
-
-    def _self_process_name(self, name, reserved_words):
-        result_name = name
-        escape_quote = self.dialect.parse_module.escape_quote
-        escape_to_quote = self.dialect.parse_module.escape_to_quote
-        if escape_quote in result_name:
-            result_name = result_name.replace(escape_quote, escape_to_quote)
-        result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
-
-        return result_name
-
-class No_Quote_Method:
-
-    def normalize_name(self, name):
-        if name.upper() == name and not \
-                self.identifier_preparer._requires_quotes(name.lower()):
-            return name.lower()
-        elif name.lower() == name:
-            return quoted_name(name, quote=True)
-        else:
-            return name
-
-    def denormalize_name(self, name):
-        if name.lower() == name and not \
-                self.identifier_preparer._requires_quotes(name.lower()):
-            name = name.upper()
-        if util.py2k:
-            name = unicode(name)
-        return name
-
-    def quote_ident(self, ident):
-        if self._requires_quotes(ident):
-            return self.quote_identifier(ident)
-        else:
-            return ident
-
-    def return_quote_str(self, ident):
-        return ident
-
-    def _self_process_name(self, name, reserved_words):
-        result_name = name
-        escape_quote = self.dialect.parse_module.escape_quote
-        escape_to_quote = self.dialect.parse_module.escape_to_quote
-        if result_name.lower() in reserved_words or escape_quote in result_name or (result_name.upper() != result_name and result_name.lower() != result_name):
-            if escape_quote in result_name:
-                result_name = result_name.replace(escape_quote, escape_to_quote)
-            result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
-
-        return result_name

@@ -15,7 +15,7 @@ setup_params = dict(
     include_package_data=True,
     entry_points={
         "sqlalchemy.dialects":
-            ["dm = dmSQLAlchemy.dmPython:DMDialect_dmPython", "dm.dmPython = dmSQLAlchemy.dmPython:DMDialect_dmPython"]
+            ["dm = dmSQLAlchemy.dmpython:DMDialect_dmPython", "dm.dmPython = dmSQLAlchemy.dmpython:DMDialect_dmPython"]
     },
     install_requires=['dmPython', 'sqlalchemy>1.0.19, <1.4'],
 )

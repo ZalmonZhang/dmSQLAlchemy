@@ -1,42 +1,28 @@
 import re
 import json
-from .globalvars import globalvars
-from sqlalchemy.sql.elements import TextClause
-from typing import Any, TypeVar, Optional, Union, Type
-from sqlalchemy.engine.interfaces import _CoreAnyExecuteParams
-from sqlalchemy.util import await_only
-from sqlalchemy.orm import sessionmaker
-try:
-    from sqlalchemy.orm._typing import OrmExecuteOptionsParameter
-except Exception:
-    from sqlalchemy.engine.interfaces import _ExecuteOptionsParameter as OrmExecuteOptionsParameter
-from sqlalchemy.orm.session import Session, _BindArguments
+from functools import wraps
+import sqlalchemy.exc as exc
+from datetime import datetime
+from .extensions import globalvars
 from collections import defaultdict
-from sqlalchemy import util, sql, text, Identity, Executable
+from typing import Any, TypeVar, Optional
+from .types import colspecs, ischema_names
+from sqlalchemy.engine.base import Connection
+from sqlalchemy import util, sql, text, Identity
 from sqlalchemy.engine import default, reflection
 from sqlalchemy.engine import ObjectKind, ObjectScope
 from sqlalchemy.sql import compiler, visitors, expression, util as sql_util
 from sqlalchemy.sql import operators as sql_operators
 from sqlalchemy.engine.reflection import ReflectionDefaults
-from sqlalchemy.sql.elements import quoted_name
-from functools import wraps
 from sqlalchemy import types as sqltypes, schema as sa_schema
 from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
     BLOB, CLOB, TIME, TIMESTAMP, FLOAT, BIGINT, String, DOUBLE_PRECISION, REAL, INTEGER
-from .types import NUMBER, _DMNumeric, VECTOR
-from .types import colspecs, ischema_names
-import sqlalchemy.sql.elements
-from datetime import datetime
-from sqlalchemy.schema import Computed
-from sqlalchemy.engine.base import Connection
-import sqlalchemy.exc as exc
+from .types import NUMBER, VECTOR
 from sqlalchemy.sql.visitors import InternalTraversal
-from sqlalchemy.engine import Result
-from sqlalchemy.sql._typing import _InfoType
+
 
 NO_ARG = util.symbol("NO_ARG")
 _S = TypeVar("_S", bound="Session")
-_SessionBind = Union["Engine", "Connection"]
 
 NO_ARG_FNS = set('UID CURRENT_DATE SYSDATE USER '
                  'CURRENT_TIME CURRENT_TIMESTAMP'.split())
@@ -662,7 +648,7 @@ class DMCompiler(compiler.SQLCompiler):
 
         text = ""
 
-        text += self.dialect.parse_module.limit_offset_clause(self, self, select, fetch_clause, fetch_clause_options, **kw)
+        text += self.dialect.parse_module.limit_offset_clause(self, select, fetch_clause, fetch_clause_options, **kw)
 
         return text
 
@@ -1612,7 +1598,17 @@ class DMExecutionContext(default.DefaultExecutionContext):
         return super(DMExecutionContext, self)._setup_crud_result_proxy()
 
     def _self_process_name(self, name, reserved_words):
-        return self.dialect.quote_module._self_process_name(self, name, reserved_words)
+        result_name = name
+        escape_quote = self.dialect.parse_module.escape_quote
+        if self.dialect.quote_module._need_quote(result_name, escape_quote, reserved_words):
+            escape_to_quote = self.dialect.parse_module.escape_to_quote
+            if escape_quote in result_name:
+                result_name = result_name.replace(escape_quote, escape_to_quote)
+            if self._double_percents:
+                result_name = result_name.replace("%", "%%")
+            result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
+
+        return result_name
         
     def _set_autoinc_col_from_lastrowid(self, table, autoinc_col, lastrowid):
         self.dialect.trace_process('DMExecutionContext', '_set_autoinc_col_from_lastrowid')
@@ -3597,284 +3593,3 @@ class _OuterJoinColumn(sql.ClauseElement):
 
     def __init__(self, column):
         self.column = column
-
-class dmSession(Session):
-    def execute(
-        self,
-        statement: Executable,
-        params: Optional[_CoreAnyExecuteParams] = None,
-        *,
-        execution_options: OrmExecuteOptionsParameter = util.EMPTY_DICT,
-        bind_arguments: Optional[_BindArguments] = None,
-        _parent_execute_state: Optional[Any] = None,
-        _add_event: Optional[Any] = None,
-    ) -> Result[Any]:
-
-        if self.bind.dialect.parse_stmt_func is not None and not isinstance(statement, TextClause):
-            if not isinstance(self, Session) and not isinstance(self, Connection):
-                raise ValueError("The db_session must be an instance object of Session or Connection of SQLAlchemy")
-
-            raw_sql, params = self.bind.dialect.parse_stmt_func(statement)
-
-            result = self.execute(text(raw_sql), params,  execution_options=execution_options, bind_arguments=bind_arguments, _parent_execute_state=_parent_execute_state, _add_event=_add_event)
-            return result
-        else:
-            return super().execute(
-                statement,
-                params,
-                execution_options=execution_options,
-                bind_arguments=bind_arguments,
-                _parent_execute_state=_parent_execute_state,
-                _add_event=_add_event,
-            )
-
-class dmsessionmaker(sessionmaker):
-
-    def __init__(
-        self,
-        bind: Optional[_SessionBind] = None,
-        *,
-        class_: Type[_S] = dmSession,  # type: ignore
-        autoflush: bool = True,
-        expire_on_commit: bool = True,
-        info: Optional[_InfoType] = None,
-        **kw: Any,
-    ):
-        super().__init__(bind, class_=class_, autoflush=autoflush, expire_on_commit=expire_on_commit, info=info, **kw)
-
-class DMDialect_Adapter:
-
-    autoincrement_str = " IDENTITY(1, 1)"
-    initial_quote = final_quote = '"'
-    escape_quote = '"'
-    escape_to_quote = '""'
-
-    def do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
-
-        if context.out_parameters != None and len(context.out_parameters) > 0:
-            dict_len = len(context.out_parameters)
-            poslist = []
-            for k in range(dict_len):
-                for j in range(columns):
-                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
-                        poslist.append(j)
-                        break
-            poslist, parameters = dialect.check_position(poslist, parameters)
-            result = cursor.executemany(statement, parameters)
-            for k in range(dict_len):
-                if result[poslist[k]] == [None]:
-                    context.out_parameters['ret_' + str(k)] = []
-                else:
-                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
-        else:
-            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table, "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
-            table_name = dialect.identifier_preparer.format_table(table_class)
-            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
-                primary_key_list = table_class.primary_key.c._all_columns
-                dict_len = len(primary_key_list)
-                statement = statement + ' RETURNING ' + table_name + '.' + dialect.do_normalize_name(
-                    dialect.identifier_preparer.format_column(primary_key_list[0]))
-            else:
-                statement = statement + ' RETURNING ' + table_name + '.ROWID'
-                dict_len = 1
-            for i in range(dict_len - 1):
-                statement = statement + ',' + table_name + '.' + dialect.do_normalize_name(dialect.identifier_preparer.format_column(primary_key_list[i + 1]))
-            statement = statement + ' INTO ?'
-            for i in range(dict_len - 1):
-                statement = statement + ', ?'
-            for i in range(rows):
-                for j in range(dict_len):
-                    parameters[i].append(None)
-            result = cursor.executemany(statement, parameters)
-            context.invoked_statement.table._update_true_table = None
-            context.inserted_primary_key_rows = []
-            if dict_len == 1:
-                temp_list = result[columns]
-                for j in range(len(temp_list)):
-                    context.inserted_primary_key_rows.append((temp_list[j],))
-            else:
-                for i in range(dict_len):
-                    context.inserted_primary_key_rows.append(tuple(result[columns + i]))
-
-    def async_do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
-
-        if context.out_parameters != None and len(context.out_parameters) > 0:
-            dict_len = len(context.out_parameters)
-            poslist = []
-            for k in range(dict_len):
-                for j in range(columns):
-                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
-                        poslist.append(j)
-                        break
-            poslist, parameters = dialect.check_position(poslist, parameters)
-            result = await_only(cursor.executemany(statement, parameters))
-            for k in range(dict_len):
-                if result[poslist[k]] == [None]:
-                    context.out_parameters['ret_' + str(k)] = []
-                else:
-                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
-        else:
-            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table,
-                                                                                        "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
-            table_name = dialect.identifier_preparer.format_table(table_class)
-            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
-                primary_key_list = table_class.primary_key.c._all_columns
-                dict_len = len(primary_key_list)
-                statement = statement + ' RETURNING ' + table_name + '.' + dialect.do_normalize_name(
-                    dialect.identifier_preparer.format_column(primary_key_list[0]))
-            else:
-                statement = statement + ' RETURNING ' + table_name + '.ROWID'
-                dict_len = 1
-            for i in range(dict_len - 1):
-                statement = statement + ',' + table_name + '.' + dialect.do_normalize_name(
-                    dialect.identifier_preparer.format_column(primary_key_list[i + 1]))
-            statement = statement + ' INTO ?'
-            for i in range(dict_len - 1):
-                statement = statement + ', ?'
-            for i in range(rows):
-                for j in range(dict_len):
-                    parameters[i].append(None)
-            await_only(cursor.executemany(statement, parameters))
-            context.invoked_statement.table._update_true_table = None
-
-    def limit_offset_clause(self, dialect, select, fetch_clause, fetch_clause_options, **kw):
-
-        text = ''
-
-        if select._offset_clause is not None:
-            offset_str = dialect.process(select._offset_clause, **kw)
-            text += "\n OFFSET %s ROWS" % offset_str
-
-        if fetch_clause is not None:
-            text += "\n FETCH FIRST %s%s ROWS %s" % (
-                dialect.process(fetch_clause, **kw),
-                " PERCENT" if fetch_clause_options["percent"] else "",
-                "WITH TIES" if fetch_clause_options["with_ties"] else "ONLY",
-            )
-
-        return text
-
-class DMMySQLDialect_Adapter:
-
-    autoincrement_str = " AUTO_INCREMENT"
-    initial_quote = final_quote = '`'
-    escape_quote = '`'
-    escape_to_quote = '``'
-
-    def do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
-        cursor.executemany(statement, parameters)
-
-    def async_do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
-        await_only(cursor.executemany(statement, parameters))
-
-    def limit_offset_clause(self, dialect, select, fetch_clause, fetch_clause_options, **kw):
-
-        text = ''
-
-        if fetch_clause is not None:
-            text += "\nLIMIT %s" % (
-                dialect.process(fetch_clause, **kw)
-            )
-
-        if select._offset_clause is not None:
-            if fetch_clause is None:
-                text += "\nLIMIT 9223372036854775807"
-            offset_str = dialect.process(select._offset_clause, **kw)
-            text += "\nOFFSET %s" % offset_str
-
-        return text
-
-class NoCompatible_Mode:
-
-    def json_proc_decorator(func):
-        def process(value):
-            if type(value) == dict or type(value) == list:
-                return str(value)
-            return value
-
-        return process
-
-class MySQLCompatible_Mode(NoCompatible_Mode):
-
-    def json_proc_decorator(func):
-        def process(value):
-            if type(value) == dict:
-                return value
-            else:
-                return json.loads(value)
-
-        return process
-
-class TSQLCompatible_Mode(NoCompatible_Mode):
-
-    pass
-
-class OracleCompatible_Mode(NoCompatible_Mode):
-
-    pass
-
-class Quote_Method:
-
-    def normalize_name(self, name):
-        return quoted_name(name, quote=True)
-
-    def denormalize_name(self, name):
-        return name
-
-    def quote_ident(self, ident):
-        return self.quote_identifier(ident)
-
-    def return_quote_str(self, ident):
-        return self.quote_identifier(ident)
-
-    def _self_process_name(self, name, reserved_words):
-        result_name = name
-        escape_quote = self.dialect.parse_module.escape_quote
-        escape_to_quote = self.dialect.parse_module.escape_to_quote
-        if escape_quote in result_name:
-            result_name = result_name.replace(escape_quote, escape_to_quote)
-        if self._double_percents:
-            result_name = result_name.replace("%", "%%")
-        result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
-
-        return result_name
-
-class No_Quote_Method:
-
-    def normalize_name(self, name):
-        if name.upper() == name and not \
-                self.identifier_preparer._requires_quotes(name.lower()):
-            return name.lower()
-        elif name.lower() == name:
-            return quoted_name(name, quote=True)
-        else:
-            return name
-
-    def denormalize_name(self, name):
-
-        if name.lower() == name and not \
-                self.identifier_preparer._requires_quotes(name.lower()):
-            name = name.upper()
-        return name
-
-    def quote_ident(self, ident):
-        if self._requires_quotes(ident):
-            return self.quote_identifier(ident)
-        else:
-            return ident
-
-    def return_quote_str(self, ident):
-        return ident
-
-    def _self_process_name(self, name, reserved_words):
-        result_name = name
-        escape_quote = self.dialect.parse_module.escape_quote
-        escape_to_quote = self.dialect.parse_module.escape_to_quote
-        if result_name.lower() in reserved_words or escape_quote in result_name or (result_name.upper() != result_name and result_name.lower() != result_name):
-            if escape_quote in result_name:
-                result_name = result_name.replace(escape_quote, escape_to_quote)
-            if self._double_percents:
-                result_name = result_name.replace("%", "%%")
-            result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
-
-        return result_name

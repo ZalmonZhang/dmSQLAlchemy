@@ -6,11 +6,11 @@ import decimal
 import ipaddress
 import collections
 from . import base as dm
-from .globalvars import globalvars
 from sqlalchemy.exc import DBAPIError
 import sqlalchemy.engine.result as _result
 from sqlalchemy import types as sqltypes, util, exc, processors
-from .base import DMCompiler, DMDialect, DMExecutionContext, DMDialect_Adapter, DMMySQLDialect_Adapter, Quote_Method, No_Quote_Method, NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, OracleCompatible_Mode
+from .base import DMCompiler, DMDialect, DMExecutionContext
+from .extensions import DMDialect_Adapter, DMMySQLDialect_Adapter, Quote_Method, No_Quote_Method, NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, OracleCompatible_Mode
 from .types import _DMBinary, _DMBoolean, _DMChar, _DMDate, _DMEnum, \
     _DMInteger, _DMInterval, _DMLongVarchar, _DMNumeric, \
     _DMNVarChar, _DMRowid, _DMString, _DMText, _DMUnicodeText, INTERVAL, \
@@ -199,16 +199,16 @@ class DMDialect_dmPython(DMDialect):
 
     # dmSession parse_type add_quote_all compatible_mode
     parse_stmt_func = None
-    parse_module = DMDialect_Adapter
-    quote_module = No_Quote_Method
-    compatible_module = NoCompatible_Mode
+    parse_module = DMDialect_Adapter()
+    quote_module = No_Quote_Method()
+    compatible_module = NoCompatible_Mode()
 
-    def my_json_deserializer(self,value):
+    def my_json_deserializer(self, value):
         import json
         if value is None:
             return None
         try:
-            if isinstance(value,str):
+            if isinstance(value, str):
                 return json.loads(value)
             # value = value.read()
         except Exception as e:
@@ -220,7 +220,7 @@ class DMDialect_dmPython(DMDialect):
         return "{}".format(value)
     _json_deserializer = my_json_deserializer
 
-    def my_json_serializer(self,value):
+    def my_json_serializer(self, value):
         return value
 
     _json_serializer=my_json_serializer
@@ -244,7 +244,7 @@ class DMDialect_dmPython(DMDialect):
         sqltypes.CHAR: _DMChar,
         sqltypes.Enum: _DMEnum,
         sqltypes.BINARY: DMBINARY,
-        sqltypes.JSON:JSON,
+        sqltypes.JSON: JSON,
         sqltypes.JSON.JSONIndexType: JSONIndexType,
         sqltypes.JSON.JSONPathType: JSONPathType,
 
@@ -328,11 +328,11 @@ class DMDialect_dmPython(DMDialect):
                     compatible_mode = cparams['compatible_mode'].upper()
                     del cparams['compatible_mode']
                     if compatible_mode == 'MYSQL':
-                        self.compatible_module = MySQLCompatible_Mode
+                        self.compatible_module = MySQLCompatible_Mode()
                     elif compatible_mode == 'TSQL':
-                        self.compatible_module = TSQLCompatible_Mode
+                        self.compatible_module = TSQLCompatible_Mode()
                     elif compatible_mode == 'ORACLE':
-                        self.compatible_module = OracleCompatible_Mode
+                        self.compatible_module = OracleCompatible_Mode()
                 else:
                     raise ValueError("The compatible_mode must be of string type and specified within the scope of DM, Oracle, MYSQL and TSQL")
 
@@ -341,12 +341,12 @@ class DMDialect_dmPython(DMDialect):
                 if type(parse_type) is str and parse_type.upper() in ['DM', 'MYSQL', 'TSQL']:
                     if parse_type.upper() == 'MYSQL':
                         if compatible_mode == None:
-                            self.compatible_module = MySQLCompatible_Mode
-                        self.parse_module = DMMySQLDialect_Adapter
+                            self.compatible_module = MySQLCompatible_Mode()
+                        self.parse_module = DMMySQLDialect_Adapter()
                         self.parse_stmt_func = parse_mysql_stmt
                     elif parse_type.upper() == 'TSQL':
                         if compatible_mode == None:
-                            self.compatible_module = TSQLCompatible_Mode
+                            self.compatible_module = TSQLCompatible_Mode()
                         self.parse_stmt_func = parse_tsql_stmt
                 else:
                     raise ValueError("The parse_type must be of string type and specified within the scope of DM, MYSQL and TSQL")
@@ -359,10 +359,15 @@ class DMDialect_dmPython(DMDialect):
                 quote_type = cparams['add_quote_all']
                 if type(quote_type) is bool:
                     if quote_type is True:
-                        self.quote_module = Quote_Method
+                        self.quote_module = Quote_Method()
                     del cparams['add_quote_all']
                 else:
                     raise ValueError("The add_quote_all must be of bool type")
+
+            if 'database' in cparams:
+                schema = cparams['database']
+                cparams['schema'] = schema
+                del cparams['database']
 
             conn = self.dbapi.connect(*cargs, **cparams)
 

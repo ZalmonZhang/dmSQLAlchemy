@@ -6,7 +6,6 @@ from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
     BLOB, CLOB, DATE, TIME, TIMESTAMP, FLOAT, BIGINT, String, Interval, VARBINARY
 from .json import JSON, JSONPathType, JSONIndexType
 from .vector import VECTORTYPE, VECTOR, VectorAdaptor
-from sqlalchemy.engine import processors
 
 class NCLOB(sqltypes.Text):
     __visit_name__ = 'NCLOB'

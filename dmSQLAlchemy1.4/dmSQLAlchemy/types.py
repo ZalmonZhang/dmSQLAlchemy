@@ -1,5 +1,5 @@
+import dmPython
 from sqlalchemy import util, sql
-from dmPython import STRING as dm_String
 from sqlalchemy import types as sqltypes
 from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
     BLOB, CLOB, DATE, TIME, TIMESTAMP, FLOAT, BIGINT, Interval, VARBINARY
@@ -117,7 +117,7 @@ class _DMBoolean(sqltypes.Boolean):
         return dbapi.NUMBER
 
     def result_processor(self, dialect, coltype):
-        if coltype == dm_String:
+        if coltype == dmPython.STRING:
             def process(value):
                 if value == '0':
                     return False
@@ -321,6 +321,7 @@ class _DMInteger(sqltypes.Integer):
     def result_processor(self, dialect, coltype):
         def to_int(val):
             if val is not None:
+                print(val)
                 val = int(val)
             return val
         return to_int
