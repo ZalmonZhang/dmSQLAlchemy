@@ -1,5 +1,6 @@
 import re
 from typing import Any, Optional
+from sqlalchemy.sql.elements import Tuple
 from sqlalchemy import util, sql, text, Identity, exc
 from sqlalchemy.engine import default, reflection
 from sqlalchemy.sql import compiler, visitors, expression, util as sql_util
@@ -8,7 +9,7 @@ from sqlalchemy import types as sqltypes, schema as sa_schema
 from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
     BLOB, CLOB, TIME, TIMESTAMP, FLOAT, BIGINT, REAL
 from .types import DOUBLE, NUMBER
-from .types import colspecs, ischema_names
+from .types import colspecs, ischema_names, BYTE
 import sqlalchemy.sql.elements
 from sqlalchemy.engine.base import Connection
 from datetime import datetime
@@ -378,7 +379,12 @@ class DMCompiler(compiler.SQLCompiler):
 
     def function_argspec(self, fn, **kw):
         self.dialect.trace_process('DMCompiler', 'function_argspec', fn, **kw)
-        if len(fn.clauses) > 0 or fn.name.upper() not in NO_ARG_FNS:
+        if type(kw) is dict and 'filter_flag' in kw and kw['filter_flag']:
+            col_info = compiler.SQLCompiler.function_argspec(self, fn, **kw)
+            if col_info == '(*)':
+                col_info = '1 ELSE 0'
+            return "(CASE WHEN %s THEN " + col_info + " END)"
+        elif len(fn.clauses) > 0 or fn.name.upper() not in NO_ARG_FNS:
             return compiler.SQLCompiler.function_argspec(self, fn, **kw)
         else:
             return ""
@@ -386,13 +392,6 @@ class DMCompiler(compiler.SQLCompiler):
     def default_from(self):
         self.dialect.trace_process('DMCompiler', 'default_from')
         return " FROM DUAL"
-    
-    def _generate_generic_unary_operator(self, unary, opstring, **kw):
-        self.dialect.trace_process('DMCompiler', '_generate_generic_unary_operator', unary, opstring, **kw)
-        if opstring == 'EXISTS ':
-            rs = 'SELECT COUNT(*) FROM ' + unary.element._compiler_dispatch(self, **kw)
-            return 'CASE WHEN (' + rs + ' AS R_EXISTS) > 0 THEN 1 ELSE 0 END '
-        return opstring + unary.element._compiler_dispatch(self, **kw)    
 
     def visit_join(self, join, from_linter=None, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_join', join, from_linter, **kwargs)
@@ -501,102 +500,6 @@ class DMCompiler(compiler.SQLCompiler):
     def _TODO_visit_compound_select(self, select):
         pass
 
-    def visit_select(self, select, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_select', select, **kwargs)
-        """Look for ``LIMIT`` and OFFSET in a select statement, and if
-        so tries to wrap it in a subquery with ``rownum`` criterion.
-        """
-
-        if not getattr(select, '_dm_visit', None):
-            if not self.dialect.use_ansi:
-                froms = self._display_froms_for_select(
-                    select, kwargs.get('asfrom', False))
-                whereclause = self._get_nonansi_join_whereclause(froms)
-                if whereclause is not None:
-                    select = select.where(whereclause)
-                    select._dm_visit = True
-
-            limit_clause = select._limit_clause
-            offset_clause = select._offset_clause
-            if limit_clause is not None or offset_clause is not None:
-                kwargs['select_wraps_for'] = select
-                select = select._generate()
-                select._dm_visit = True
-
-                # Wrap the middle select and add the hint
-                limitselect = sql.select([c for c in select.c])
-                if limit_clause is not None and \
-                    self.dialect.optimize_limits and \
-                        select._simple_int_limit:
-                    limitselect = limitselect.prefix_with(
-                        "/*+ FIRST_ROWS(%d) */" %
-                        select._limit)
-
-                limitselect._dm_visit = True
-                limitselect._is_wrapper = True
-
-                # add expressions to accommodate FOR UPDATE OF
-                for_update = select._for_update_arg
-                if for_update is not None and for_update.of:
-                    for_update = for_update._clone()
-                    for_update._copy_internals()
-
-                    for elem in for_update.of:
-                        select.append_column(elem)
-
-                    adapter = sql_util.ClauseAdapter(select)
-                    for_update.of = [
-                        adapter.traverse(elem)
-                        for elem in for_update.of]
-
-                # If needed, add the limiting clause
-                if limit_clause is not None:
-                    if not self.dialect.use_binds_for_limits:
-                        # use simple int limits, will raise an exception
-                        # if the limit isn't specified this way
-                        max_row = select._limit
-
-                        if offset_clause is not None:
-                            max_row += select._offset
-                        max_row = sql.literal_column("%d" % max_row)
-                    else:
-                        max_row = limit_clause
-                        if offset_clause is not None:
-                            max_row = max_row + offset_clause
-                    limitselect.append_whereclause(
-                        sql.literal_column("ROWNUM") <= max_row)
-
-                # If needed, add the dm_rn, and wrap again with offset.
-                if offset_clause is None:
-                    limitselect._for_update_arg = for_update
-                    select = limitselect
-                else:
-                    limitselect = limitselect.column(
-                        sql.literal_column("ROWNUM").label("dm_rn"))
-                    limitselect._dm_visit = True
-                    limitselect._is_wrapper = True
-
-                    offsetselect = sql.select(
-                        [c for c in limitselect.c if c.key != 'dm_rn'])
-                    offsetselect._dm_visit = True
-                    offsetselect._is_wrapper = True
-
-                    if for_update is not None and for_update.of:
-                        for elem in for_update.of:
-                            if limitselect.corresponding_column(elem) is None:
-                                limitselect.append_column(elem)
-
-                    if not self.dialect.use_binds_for_limits:
-                        offset_clause = sql.literal_column(
-                            "%d" % select._offset)
-                    offsetselect.append_whereclause(
-                        sql.literal_column("dm_rn") > offset_clause)
-
-                    offsetselect._for_update_arg = for_update
-                    select = offsetselect
-
-        return compiler.SQLCompiler.visit_select(self, select, **kwargs)
-
     def limit_clause(self, select, **kw):
         if select._fetch_clause_options is None:
             fetch_clause_options = {"percent": False, "with_ties": False}
@@ -633,20 +536,7 @@ class DMCompiler(compiler.SQLCompiler):
             tmp += " SKIP LOCKED"
 
         return tmp
-    
-    # for trace only
-    def bindparam_string(
-        self,
-        name,
-        positional_names=None,
-        post_compile=False,
-        expanding=False,
-        escaped_from=None,
-        **kw
-    ):
-        self.dialect.trace_process('DMCompiler', 'bindparam_string', name, positional_names, post_compile, expanding, escaped_from, **kw)
-        return super(DMCompiler, self).bindparam_string(name, positional_names, post_compile, expanding, escaped_from, **kw)
-    
+
     def construct_params(
         self,
         params=None,
@@ -873,11 +763,19 @@ class DMCompiler(compiler.SQLCompiler):
     def visit_fromclause(self, fromclause, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_fromclause', fromclause, **kwargs)
         return super(DMCompiler, self).visit_fromclause(fromclause, **kwargs)
-        
+
     def visit_funcfilter(self, funcfilter, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_funcfilter', funcfilter, **kwargs)
-        super(DMCompiler, self).visit_funcfilter(funcfilter, **kwargs)
-        
+        if type(kwargs) is dict:
+            temp_kwargs = kwargs.copy()
+            temp_kwargs["filter_flag"] = True
+            return (funcfilter.func._compiler_dispatch(self, **temp_kwargs) %
+                    funcfilter.criterion._compiler_dispatch(self, **temp_kwargs))
+        else:
+            return "%s FILTER (WHERE %s)" % (
+                funcfilter.func._compiler_dispatch(self, **kwargs),
+                funcfilter.criterion._compiler_dispatch(self, **kwargs),
+            )
+
     def visit_function(self, func, add_to_result_map=None, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_function', func, add_to_result_map, **kwargs)
         return super(DMCompiler, self).visit_function(func, add_to_result_map, **kwargs)
@@ -1006,27 +904,8 @@ class DMCompiler(compiler.SQLCompiler):
     
     def visit_scalar_function_column(self, element, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_scalar_function_column', element, **kw)
-        return super(DMCompiler, self).visit_scalar_function_column(element, **kw)        
-        
-    def visit_select(
-        self,
-        select_stmt,
-        asfrom=False,
-        insert_into=False,
-        fromhints=None,
-        compound_index=None,
-        select_wraps_for=None,
-        lateral=False,
-        from_linter=None,
-        **kwargs
-    ):  
-        if (int(sqlalchemy.__version__.split('.')[-1]) >= 24):  
-            self.dialect.trace_process('DMCompiler', 'visit_select', select_stmt, asfrom, insert_into, fromhints, compound_index, select_wraps_for, lateral, from_linter, **kwargs)
-            return super(DMCompiler, self).visit_select( select_stmt, asfrom, insert_into, fromhints, compound_index, select_wraps_for, lateral, from_linter, **kwargs)
-        else:
-            self.dialect.trace_process('DMCompiler', 'visit_select', select_stmt, asfrom, fromhints, compound_index, select_wraps_for, lateral, from_linter, **kwargs)
-            return super(DMCompiler, self).visit_select( select_stmt, asfrom, fromhints, compound_index, select_wraps_for, lateral, from_linter, **kwargs)
-        
+        return super(DMCompiler, self).visit_scalar_function_column(element, **kw)
+
     def visit_startswith_op_binary(self, binary, operator, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_startswith_op_binary', binary, operator, **kw)
         return super(DMCompiler, self).visit_startswith_op_binary(binary, operator, **kw)
@@ -1086,11 +965,79 @@ class DMCompiler(compiler.SQLCompiler):
                                    taf, compound_index,
                                    asfrom, parens, **kw)
         return super(DMCompiler, self).visit_text_as_from(taf, compound_index, asfrom, parens, **kw)
-    
-    def visit_tuple(self, clauselist, **kw):
-        self.dialect.trace_process('DMCompiler', 'visit_tuple', clauselist, **kw)
-        return super(DMCompiler, self).visit_tuple(clauselist, **kw)        
-        
+
+    def _get_tuple_list(self, tuple, **kw):
+        return [
+            s
+            for s in (c._compiler_dispatch(self, **kw) for c in tuple.clauses)
+            if s
+        ]
+
+    def _resolve_param(self, param_value, tuple, i):
+        if param_value == '?':
+            return tuple.clauses[i].value
+        else:
+            return param_value
+
+    def _dm_tuple_op(self, left_tuple, right_tuple, opstring, eager_grouping, **kw):
+        kw["eager_grouping"] = eager_grouping
+        left_list = self._get_tuple_list(left_tuple, **kw)
+        right_list = self._get_tuple_list(right_tuple, **kw)
+        if opstring in [' = ', ' != ']:
+            if right_list[0] == 'NULL':
+                op_str = "(%s IS %s "
+            else:
+                op_str = "(%s = %s "
+            result = op_str % (left_list[0], right_list[0])
+            for i in range(len(left_list) - 1):
+                if right_list[i + 1] == 'NULL':
+                    op_str = "AND %s IS %s "
+                else:
+                    op_str = "AND %s = %s "
+                result += op_str % (left_list[i + 1], right_list[i + 1])
+            if opstring == ' != ':
+                result = ' NOT ' + result
+        else:
+            result = "(%s%s%s " % (left_list[0], opstring, right_list[0])
+            for i in range(len(left_list) - 1):
+                result += "OR (%s = %s " % (self._resolve_param(left_list[0], left_tuple, 0),
+                                            self._resolve_param(right_list[0], right_tuple, 0))
+                for j in range(i):
+                    result += "AND %s = %s " % (self._resolve_param(left_list[j + 1], left_tuple, j + 1),
+                                                self._resolve_param(right_list[j + 1], right_tuple, j + 1))
+                result += "AND %s%s%s) " % (left_list[i + 1], opstring, right_list[i + 1])
+        result += ')'
+        return result
+
+    def _generate_generic_binary(
+        self,
+        binary,
+        opstring,
+        eager_grouping=False,
+        **kw,
+    ) -> str:
+        _in_operator_expression = kw.get("_in_operator_expression", False)
+
+        kw["_in_operator_expression"] = True
+        kw["_binary_op"] = binary.operator
+        op_list = [' > ', ' = ', ' < ', ' >= ', ' <= ', ' != ']
+        if isinstance(binary.left, Tuple) and isinstance(binary.right, Tuple) and type(opstring) is str and opstring in op_list:
+            text = self._dm_tuple_op(binary.left, binary.right, opstring, eager_grouping)
+        else:
+            text = (
+                binary.left._compiler_dispatch(
+                    self, eager_grouping=eager_grouping, **kw
+                )
+                + opstring
+                + binary.right._compiler_dispatch(
+                    self, eager_grouping=eager_grouping, **kw
+                )
+            )
+
+        if _in_operator_expression and eager_grouping:
+            text = "(%s)" % text
+        return text
+
     def visit_typeclause(self, typeclause, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_typeclause', typeclause, **kw)
         return super(DMCompiler, self).visit_typeclause(typeclause, **kw)
@@ -1177,6 +1124,44 @@ class DMCompiler(compiler.SQLCompiler):
 
     def visit_json_path_getitem_op_binary(self, binary, operator, **kw):
         return self._render_json_extract_from_binary(binary, operator, **kw)
+
+    def _get_regexp_args(self, binary, kw):
+        string = self.process(binary.left, **kw)
+        pattern = self.process(binary.right, **kw)
+        flags = binary.modifiers["flags"]
+        if flags is not None:
+            flags = self.process(flags, **kw)
+        return string, pattern, flags
+
+    def visit_regexp_match_op_binary(self, binary, operator, **kw):
+        string, pattern, flags = self._get_regexp_args(binary, kw)
+        if flags is None:
+            return "REGEXP_LIKE(%s, %s)" % (string, pattern)
+        else:
+            return "REGEXP_LIKE(%s, %s, %s)" % (string, pattern, flags)
+
+    def visit_not_regexp_match_op_binary(self, binary, operator, **kw):
+        return "NOT %s" % self.visit_regexp_match_op_binary(
+            binary, operator, **kw
+        )
+
+    def visit_regexp_replace_op_binary(self, binary, operator, **kw):
+        string, pattern, flags = self._get_regexp_args(binary, kw)
+        replacement = self.process(binary.modifiers["replacement"], **kw)
+        if flags is None:
+            return "REGEXP_REPLACE(%s, %s, %s)" % (
+                string,
+                pattern,
+                replacement,
+            )
+        else:
+            return "REGEXP_REPLACE(%s, %s, %s, %s)" % (
+                string,
+                pattern,
+                replacement,
+                flags,
+            )
+
 
 class DMDDLCompiler(compiler.DDLCompiler):
     
@@ -1514,7 +1499,6 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     def format_table_seq(self, table, use_schema=True):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_table_seq', table, use_schema)
         return super(DMIdentifierPreparer, self).format_table_seq(table, use_schema)
-        
 
 class DMExecutionContext(default.DefaultExecutionContext):
     def fire_sequence(self, seq, type_):
@@ -1585,7 +1569,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
             escape_to_quote = self.dialect.parse_module.escape_to_quote
             if escape_quote in result_name:
                 result_name = result_name.replace(escape_quote, escape_to_quote)
-            if self._double_percents:
+            if self.dialect.identifier_preparer._double_percents:
                 result_name = result_name.replace("%", "%%")
             result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
 
@@ -2241,6 +2225,8 @@ class DMDialect(default.DefaultDialect):
                 coltype = sqltypes.Integer
             elif 'WITH TIME ZONE' in coltype:
                 coltype = TIMESTAMP(timezone = True)
+            elif coltype == 'BYTE':
+                coltype = BYTE
             else:
                 coltype = re.sub(r'\(\d+\)', '', coltype)
                 try:

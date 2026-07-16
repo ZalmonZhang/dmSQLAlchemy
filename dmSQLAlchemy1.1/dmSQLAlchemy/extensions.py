@@ -92,7 +92,7 @@ class NoCompatible_Mode:
 
     def json_proc_decorator(self, func):
         def process(value):
-            if type(value) == dict or type(value) == list:
+            if type(value) is dict or type(value) is list:
                 return str(value)
             return value
 
@@ -102,7 +102,7 @@ class MySQLCompatible_Mode(NoCompatible_Mode):
 
     def json_proc_decorator(self, func):
         def process(value):
-            if type(value) == dict:
+            if type(value) is dict:
                 return value
             else:
                 return json.loads(value)

@@ -395,7 +395,7 @@ class DMDialect_dmPython(DMDialect):
         columns = len(parameters[0]) if parameters else 0
         for i in range(rows):
             for j in range(columns):
-                if type(parameters[i][j]) == datetime.datetime:
+                if type(parameters[i][j]) is datetime.datetime:
                     temp = parameters[i][j]
                     str_temp = temp.strftime("%Y-%m-%d %H:%M:%S.%f %Z")
                     if 'UTC' in str_temp:

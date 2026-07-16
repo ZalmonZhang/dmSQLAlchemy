@@ -39,10 +39,10 @@ class ConnectParams:
     def __init__(
         self,
         *,
-        user: Optional[str] = None,
-        password: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
+        user=None,
+        password=None,
+        host=None,
+        port=None,
     ):
         pass
 
@@ -95,10 +95,10 @@ class AsyncConnection(dmPython.Connection):
 
     def __init__(
         self,
-        dsn: str,
-        params: ConnectParams,
-        kwargs: dict,
-    ) -> None:
+        dsn,
+        params,
+        kwargs,
+    ):
         self._connect_coroutine = self._connect(params, kwargs)
 
     def __await__(self):
@@ -129,8 +129,8 @@ class AsyncConnection(dmPython.Connection):
         return self._impl
 
     def _verify_can_execute(
-        self, parameters: Any, keyword_parameters: Any
-    ) -> Any:
+        self, parameters, keyword_parameters
+    ):
         self._verify_connected()
         if keyword_parameters:
             if parameters:
@@ -144,11 +144,11 @@ class AsyncConnection(dmPython.Connection):
 
     async def callfunc(
         self,
-        name: str,
-        return_type: Any,
-        parameters: Optional[Union[list, tuple]] = None,
-        keyword_parameters: Optional[dict] = None,
-    ) -> Any:
+        name,
+        return_type,
+        parameters=None,
+        keyword_parameters=None,
+    ):
         with self.cursor() as cursor:
             return await cursor.callfunc(
                 name, return_type, parameters, keyword_parameters
@@ -156,53 +156,53 @@ class AsyncConnection(dmPython.Connection):
 
     async def callproc(
         self,
-        name: str,
-        parameters: Optional[Union[list, tuple]] = None,
-        keyword_parameters: Optional[dict] = None,
-    ) -> list:
+        name,
+        parameters=None,
+        keyword_parameters=None,
+    ):
         with self.cursor() as cursor:
             return await cursor.callproc(name, parameters, keyword_parameters)
 
     async def changepassword(
-        self, old_password: str, new_password: str
-    ) -> None:
+        self, old_password, new_password
+    ):
         self._verify_connected()
         await self._impl.change_password(old_password, new_password)
 
-    async def close(self) -> None:
+    async def close(self):
         self._verify_connected()
         await self._impl.close()
         self._impl = None
 
-    async def commit(self) -> None:
+    async def commit(self):
         self._verify_connected()
         await self._impl.commit()
 
-    def cursor(self, scrollable: bool = False) -> AsyncCursor:
+    def cursor(self, scrollable=False):
         self._verify_connected()
         return AsyncCursor(self, scrollable)
 
     async def execute(
         self,
-        statement: str,
-        parameters: Optional[Union[list, tuple, dict]] = None,
-    ) -> None:
+        statement,
+        parameters=None,
+    ):
         with self.cursor() as cursor:
             await cursor.execute(statement, parameters)
 
     async def executemany(
-        self, statement: Union[str, None], parameters: Union[list, int]
-    ) -> None:
+        self, statement, parameters
+    ):
         with self.cursor() as cursor:
             await cursor.executemany(statement, parameters)
 
     async def fetchall(
         self,
-        statement: str,
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        arraysize: Optional[int] = None,
-        rowfactory: Optional[Callable] = None,
-    ) -> list:
+        statement,
+        parameters=None,
+        arraysize=None,
+        rowfactory=None,
+    ):
         with self.cursor() as cursor:
             if arraysize is not None:
                 cursor.arraysize = arraysize
@@ -213,9 +213,9 @@ class AsyncConnection(dmPython.Connection):
 
     async def fetch_df_all(
         self,
-        statement: str,
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        arraysize: Optional[int] = None,
+        statement,
+        parameters=None,
+        arraysize=None,
     ):
         cursor = self.cursor()
         cursor._impl.fetching_arrow = True
@@ -227,9 +227,9 @@ class AsyncConnection(dmPython.Connection):
 
     async def fetch_df_batches(
         self,
-        statement: str,
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        size: Optional[int] = None,
+        statement,
+        parameters=None,
+        size=None,
     ):
         cursor = self.cursor()
         cursor._impl.fetching_arrow = True
@@ -245,11 +245,11 @@ class AsyncConnection(dmPython.Connection):
 
     async def fetchmany(
         self,
-        statement: str,
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        num_rows: Optional[int] = None,
-        rowfactory: Optional[Callable] = None,
-    ) -> list:
+        statement,
+        parameters=None,
+        num_rows=None,
+        rowfactory=None,
+    ):
         with self.cursor() as cursor:
             if num_rows is None:
                 num_rows = cursor.arraysize
@@ -262,42 +262,42 @@ class AsyncConnection(dmPython.Connection):
 
     async def fetchone(
         self,
-        statement: str,
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        rowfactory: Optional[Callable] = None,
-    ) -> Any:
+        statement,
+        parameters=None,
+        rowfactory=None,
+    ):
         with self.cursor() as cursor:
             cursor.prefetchrows = cursor.arraysize = 1
             await cursor.execute(statement, parameters)
             cursor.rowfactory = rowfactory
             return await cursor.fetchone()
 
-    async def ping(self) -> None:
+    async def ping(self):
         self._verify_connected()
         await self._impl.ping()
 
-    async def rollback(self) -> None:
+    async def rollback(self):
         self._verify_connected()
         await self._impl.rollback()
 
     async def tpc_begin(
-        self, xid: Xid, flags: int = 0x00000001, timeout: int = 0
-    ) -> None:
+        self, xid, flags=0x00000001, timeout=0
+    ):
         self._verify_connected()
         self._verify_xid(xid)
         await self._impl.tpc_begin(xid, flags, timeout)
 
     async def tpc_commit(
-        self, xid: Optional[Xid] = None, one_phase: bool = False
-    ) -> None:
+        self, xid=None, one_phase=False
+    ):
         self._verify_connected()
         if xid is not None:
             self._verify_xid(xid)
         await self._impl.tpc_commit(xid, one_phase)
 
     async def tpc_end(
-        self, xid: Optional[Xid] = None, flags: int = 0
-    ) -> None:
+        self, xid=None, flags=0
+    ):
         self._verify_connected()
         if xid is not None:
             self._verify_xid(xid)
@@ -305,18 +305,18 @@ class AsyncConnection(dmPython.Connection):
             raise
         await self._impl.tpc_end(xid, flags)
 
-    async def tpc_forget(self, xid: Xid) -> None:
+    async def tpc_forget(self, xid):
         self._verify_connected()
         self._verify_xid(xid)
         await self._impl.tpc_forget(xid)
 
-    async def tpc_prepare(self, xid: Optional[Xid] = None) -> bool:
+    async def tpc_prepare(self, xid=None):
         self._verify_connected()
         if xid is not None:
             self._verify_xid(xid)
         return await self._impl.tpc_prepare(xid)
 
-    async def tpc_recover(self) -> list:
+    async def tpc_recover(self):
         with self.cursor() as cursor:
             await cursor.execute(
                 """
@@ -329,23 +329,23 @@ class AsyncConnection(dmPython.Connection):
             cursor.rowfactory = Xid
             return await cursor.fetchall()
 
-    async def tpc_rollback(self, xid: Optional[Xid] = None) -> None:
+    async def tpc_rollback(self, xid=None):
         self._verify_connected()
         if xid is not None:
             self._verify_xid(xid)
         await self._impl.tpc_rollback(xid)
 
 def _async_connection_factory(
-    f: Callable[..., AsyncConnection]
-) -> Callable[..., AsyncConnection]:
+    f
+):
     @functools.wraps(f)
     def connect_async(
-        dsn: Optional[str] = None,
+        dsn=None,
         *,
-        conn_class: Type[AsyncConnection] = AsyncConnection,
-        params: Optional[ConnectParams] = None,
+        conn_class=AsyncConnection,
+        params=None,
         **kwargs,
-    ) -> AsyncConnection:
+    ):
         f(
             dsn=dsn,
             conn_class=conn_class,
@@ -365,39 +365,39 @@ def _async_connection_factory(
 
 @_async_connection_factory
 def connect_async(
-    dsn: Optional[str] = None,
+    dsn=None,
     *,
-    user: Optional[str] = None,
-    password: Optional[str] = None,
-    host: Optional[str] = None,
-    server: Optional[str] = None,
-    port: Optional[int] = None,
-    conn_class: Type[AsyncConnection] = AsyncConnection,
-    params: Optional[ConnectParams] = None,
-    access_mode: Optional[int] = None,
-    autoCommit: Optional[bool] = None,
-    connection_timeout: Optional[int] = None,
-    login_timeout: Optional[int] = None,
-    txn_isolation: Optional[int] = None,
-    compress_msg: Optional[bool] = None,
-    use_stmt_pool: Optional[bool] = None,
-    ssl_path: Optional[str] = None,
-    ssl_pwd: Optional[str] = None,
-    mpp_login: Optional[bool] = None,
-    ukey_name: Optional[str] = None,
-    ukey_pin: Optional[str] = None,
-    rwseparate: Optional[bool] = None,
-    rwseparate_percent: Optional[int] = None,
-    lang_id: Optional[int] = None,
-    local_code: Optional[int] = None,
-    cursorclass: Optional[int] = None,
-    database: Optional[str] = None,
-    schema: Optional[str] = None,
-    shake_crypto: Optional[str] = None,
-    dmsvc_path: Optional[str] = None,
-    parse_type: Optional[str] = None,
-    _timeout: Optional[int] = None,
-) -> AsyncConnection:
+    user=None,
+    password=None,
+    host=None,
+    server=None,
+    port=None,
+    conn_class=AsyncConnection,
+    params=None,
+    access_mode=None,
+    autoCommit=None,
+    connection_timeout=None,
+    login_timeout=None,
+    txn_isolation=None,
+    compress_msg=None,
+    use_stmt_pool=None,
+    ssl_path=None,
+    ssl_pwd=None,
+    mpp_login=None,
+    ukey_name=None,
+    ukey_pin=None,
+    rwseparate=None,
+    rwseparate_percent=None,
+    lang_id=None,
+    local_code=None,
+    cursorclass=None,
+    database=None,
+    schema=None,
+    shake_crypto=None,
+    dmsvc_path=None,
+    parse_type=None,
+    _timeout=None,
+):
     pass
 
 class BaseCursor:
@@ -405,9 +405,9 @@ class BaseCursor:
 
     def __init__(
         self,
-        connection: "connection_module.Connection",
-        scrollable: bool = False,
-    ) -> None:
+        connection,
+        scrollable=False,
+    ):
         self.connection = connection
         self._impl = connection._impl.create_cursor_impl(scrollable)
 
@@ -431,11 +431,11 @@ class BaseCursor:
 
     def _call(
         self,
-        name: str,
-        parameters: Union[list, tuple],
-        keyword_parameters: dict,
-        return_value: Any = None,
-    ) -> None:
+        name,
+        parameters,
+        keyword_parameters,
+        return_value=None,
+    ):
         if parameters is not None and not isinstance(parameters, (list, tuple)):
             raise
         if keyword_parameters is not None and not isinstance(
@@ -448,11 +448,11 @@ class BaseCursor:
 
     def _call_get_execute_args(
         self,
-        name: str,
-        parameters: Union[list, tuple],
-        keyword_parameters: dict,
-        return_value: str = None,
-    ) -> None:
+        name,
+        parameters,
+        keyword_parameters,
+        return_value=None,
+    ):
         bind_names = []
         bind_values = []
         statement_parts = ["begin "]
@@ -473,8 +473,8 @@ class BaseCursor:
         return (statement, bind_values)
 
     def _prepare(
-        self, statement: str, tag: str = None, cache_statement: bool = True
-    ) -> None:
+        self, statement, tag=None, cache_statement=True
+    ):
         self._impl.prepare(statement, tag, cache_statement)
 
     def _prepare_for_execute(
@@ -485,23 +485,23 @@ class BaseCursor:
             self, statement, parameters, keyword_parameters
         )
 
-    def _verify_fetch(self) -> None:
+    def _verify_fetch(self):
         self._verify_open()
         if not self._impl.is_query(self):
             raise
 
-    def _verify_open(self) -> None:
+    def _verify_open(self):
         if self._impl is None:
             raise
         self.connection._verify_connected()
 
     @property
-    def arraysize(self) -> int:
+    def arraysize(self):
         self._verify_open()
         return self._impl.arraysize
 
     @arraysize.setter
-    def arraysize(self, value: int) -> None:
+    def arraysize(self, value):
         self._verify_open()
         if not isinstance(value, int) or value <= 0:
             raise
@@ -510,8 +510,8 @@ class BaseCursor:
     def arrayvar(
         self,
         typ,
-        value: Union[list, int],
-        size: int = 0,
+        value,
+        size=0,
     ):
         self._verify_open()
         if isinstance(value, list):
@@ -531,107 +531,107 @@ class BaseCursor:
             var.setvalue(0, value)
         return var
 
-    def bindnames(self) -> list:
+    def bindnames(self):
         self._verify_open()
         if self._impl.statement is None:
             raise
         return self._impl.get_bind_names()
 
     @property
-    def bindvars(self) -> list:
+    def bindvars(self):
         self._verify_open()
         return self._impl.get_bind_vars()
 
-    def close(self) -> None:
+    def close(self):
         self._verify_open()
         self._impl.close()
         self._impl = None
 
     @property
-    def fetchvars(self) -> list:
+    def fetchvars(self):
         self._verify_open()
         return self._impl.get_fetch_vars()
 
-    def getarraydmlrowcounts(self) -> list:
+    def getarraydmlrowcounts(self):
         self._verify_open()
         return self._impl.get_array_dml_row_counts()
 
-    def getbatcherrors(self) -> list:
+    def getbatcherrors(self):
         self._verify_open()
         return self._impl.get_batch_errors()
 
-    def getimplicitresults(self) -> list:
+    def getimplicitresults(self):
         self._verify_open()
         return self._impl.get_implicit_results(self.connection)
 
     @property
-    def inputtypehandler(self) -> Callable:
+    def inputtypehandler(self):
         self._verify_open()
         return self._impl.inputtypehandler
 
     @inputtypehandler.setter
-    def inputtypehandler(self, value: Callable) -> None:
+    def inputtypehandler(self, value):
         self._verify_open()
         self._impl.inputtypehandler = value
 
     @property
-    def lastrowid(self) -> str:
+    def lastrowid(self):
         self._verify_open()
         return self._impl.get_lastrowid()
 
     @property
-    def outputtypehandler(self) -> Callable:
+    def outputtypehandler(self):
         self._verify_open()
         return self._impl.outputtypehandler
 
     @outputtypehandler.setter
-    def outputtypehandler(self, value: Callable) -> None:
+    def outputtypehandler(self, value):
         self._verify_open()
         self._impl.outputtypehandler = value
 
     @property
-    def prefetchrows(self) -> int:
+    def prefetchrows(self):
         self._verify_open()
         return self._impl.prefetchrows
 
     @prefetchrows.setter
-    def prefetchrows(self, value: int) -> None:
+    def prefetchrows(self, value):
         self._verify_open()
         self._impl.prefetchrows = value
 
     def prepare(
-        self, statement: str, tag: str = None, cache_statement: bool = True
-    ) -> None:
+        self, statement, tag=None, cache_statement=True
+    ):
         self._verify_open()
         self._prepare(statement, tag, cache_statement)
 
     @property
-    def rowcount(self) -> int:
+    def rowcount(self):
         if self._impl is not None and self.connection._impl is not None:
             return self._impl.rowcount
         return -1
 
     @property
-    def rowfactory(self) -> Callable:
+    def rowfactory(self):
         self._verify_open()
         return self._impl.rowfactory
 
     @rowfactory.setter
-    def rowfactory(self, value: Callable) -> None:
+    def rowfactory(self, value):
         self._verify_open()
         self._impl.rowfactory = value
 
     @property
-    def scrollable(self) -> bool:
+    def scrollable(self):
         self._verify_open()
         return self._impl.scrollable
 
     @scrollable.setter
-    def scrollable(self, value: bool) -> None:
+    def scrollable(self, value):
         self._verify_open()
         self._impl.scrollable = value
 
-    def setinputsizes(self, *args: Any, **kwargs: Any) -> Union[list, dict]:
+    def setinputsizes(self, *args, **kwargs):
         if args and kwargs:
             raise
         elif args or kwargs:
@@ -639,28 +639,28 @@ class BaseCursor:
             return self._impl.setinputsizes(self.connection, args, kwargs)
         return []
 
-    def setoutputsize(self, size: int, column: int = 0) -> None:
+    def setoutputsize(self, size, column=0):
         pass
 
     @property
-    def statement(self) -> Union[str, None]:
+    def statement(self):
         if self._impl is not None:
             return self._impl.statement
 
     def var(
         self,
         typ,
-        size: int = 0,
-        arraysize: int = 1,
-        inconverter: Callable = None,
-        outconverter: Callable = None,
-        typename: str = None,
-        encoding_errors: str = None,
-        bypass_decode: bool = False,
-        convert_nulls: bool = False,
+        size=0,
+        arraysize=1,
+        inconverter=None,
+        outconverter=None,
+        typename=None,
+        encoding_errors=None,
+        bypass_decode=False,
+        convert_nulls=False,
         *,
-        encodingErrors: str = None,
-    ) -> "Var":
+        encodingErrors=None,
+    ):
         self._verify_open()
         if typename is not None:
             typ = self.connection.gettype(typename)
@@ -701,23 +701,23 @@ class Cursor(BaseCursor):
             return row
         raise StopIteration
 
-    def _get_oci_attr(self, attr_num: int, attr_type: int) -> Any:
+    def _get_oci_attr(self, attr_num, attr_type):
         self._verify_open()
         return self._impl._get_oci_attr(attr_num, attr_type)
 
-    def _set_oci_attr(self, attr_num: int, attr_type: int, value: Any) -> None:
+    def _set_oci_attr(self, attr_num, attr_type, value):
         self._verify_open()
         self._impl._set_oci_attr(attr_num, attr_type, value)
 
     def callfunc(
         self,
-        name: str,
-        return_type: Any,
-        parameters: Optional[Union[list, tuple]] = None,
-        keyword_parameters: Optional[dict] = None,
+        name,
+        return_type,
+        parameters=None,
+        keyword_parameters=None,
         *,
-        keywordParameters: Optional[dict] = None,
-    ) -> Any:
+        keywordParameters=None,
+    ):
         var = self.var(return_type)
         if keywordParameters is not None:
             if keyword_parameters is not None:
@@ -728,12 +728,12 @@ class Cursor(BaseCursor):
 
     def callproc(
         self,
-        name: str,
-        parameters: Optional[Union[list, tuple]] = None,
-        keyword_parameters: Optional[dict] = None,
+        name,
+        parameters=None,
+        keyword_parameters=None,
         *,
-        keywordParameters: Optional[dict] = None,
-    ) -> list:
+        keywordParameters=None,
+    ):
         if keywordParameters is not None:
             if keyword_parameters is not None:
                 raise
@@ -747,10 +747,10 @@ class Cursor(BaseCursor):
 
     def execute(
         self,
-        statement: Optional[str],
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        **keyword_parameters: Any,
-    ) -> Any:
+        statement,
+        parameters=None,
+        **keyword_parameters,
+    ):
         self._prepare_for_execute(statement, parameters, keyword_parameters)
         impl = self._impl
         impl.execute(self)
@@ -759,11 +759,11 @@ class Cursor(BaseCursor):
 
     def executemany(
         self,
-        statement: Optional[str],
-        parameters: Union[list, int],
-        batcherrors: bool = False,
-        arraydmlrowcounts: bool = False,
-    ) -> None:
+        statement,
+        parameters,
+        batcherrors=False,
+        arraydmlrowcounts=False,
+    ):
         self._verify_open()
         num_execs = self._impl._prepare_for_executemany(
             self, statement, parameters
@@ -772,7 +772,7 @@ class Cursor(BaseCursor):
             self, num_execs, bool(batcherrors), bool(arraydmlrowcounts)
         )
 
-    def fetchall(self) -> list:
+    def fetchall(self):
         self._verify_fetch()
         result = []
         fetch_next_row = self._impl.fetch_next_row
@@ -784,8 +784,8 @@ class Cursor(BaseCursor):
         return result
 
     def fetchmany(
-        self, size: Optional[int] = None, numRows: Optional[int] = None
-    ) -> list:
+        self, size=None, numRows=None
+    ):
         self._verify_fetch()
         if size is None:
             if numRows is not None:
@@ -803,16 +803,16 @@ class Cursor(BaseCursor):
             result.append(row)
         return result
 
-    def fetchone(self) -> Any:
+    def fetchone(self):
         self._verify_fetch()
         return self._impl.fetch_next_row(self)
 
-    def parse(self, statement: str) -> None:
+    def parse(self, statement):
         self._verify_open()
         self._prepare(statement)
         self._impl.parse(self)
 
-    def scroll(self, value: int = 0, mode: str = "relative") -> None:
+    def scroll(self, value=0, mode="relative"):
         self._verify_open()
         self._impl.scroll(self, value, mode)
 
@@ -841,21 +841,21 @@ class AsyncCursor(BaseCursor):
 
     async def callfunc(
         self,
-        name: str,
-        return_type: Any,
-        parameters: Optional[Union[list, tuple]] = None,
-        keyword_parameters: Optional[dict] = None,
-    ) -> Any:
+        name,
+        return_type,
+        parameters=None,
+        keyword_parameters=None,
+    ):
         var = self.var(return_type)
         await self._call(name, parameters, keyword_parameters, var)
         return var.getvalue()
 
     async def callproc(
         self,
-        name: str,
-        parameters: Optional[Union[list, tuple]] = None,
-        keyword_parameters: Optional[dict] = None,
-    ) -> list:
+        name,
+        parameters=None,
+        keyword_parameters=None,
+    ):
         await self._call(name, parameters, keyword_parameters)
         if parameters is None:
             return []
@@ -865,20 +865,20 @@ class AsyncCursor(BaseCursor):
 
     async def execute(
         self,
-        statement: Optional[str],
-        parameters: Optional[Union[list, tuple, dict]] = None,
-        **keyword_parameters: Any,
-    ) -> None:
+        statement,
+        parameters=None,
+        **keyword_parameters,
+    ):
         self._prepare_for_execute(statement, parameters, keyword_parameters)
         yield await self._impl.execute(self)
 
     async def executemany(
         self,
-        statement: Optional[str],
-        parameters: Union[list, int],
-        batcherrors: bool = False,
-        arraydmlrowcounts: bool = False,
-    ) -> None:
+        statement,
+        parameters,
+        batcherrors=False,
+        arraydmlrowcounts=False,
+    ):
         self._verify_open()
         num_execs = self._impl._prepare_for_executemany(
             self, statement, parameters
@@ -887,7 +887,7 @@ class AsyncCursor(BaseCursor):
             self, num_execs, bool(batcherrors), bool(arraydmlrowcounts)
         )
 
-    async def fetchall(self) -> list:
+    async def fetchall(self):
         self._verify_fetch()
         result = []
         fetch_next_row = self._impl.fetch_next_row
@@ -898,7 +898,7 @@ class AsyncCursor(BaseCursor):
             result.append(row)
         return result
 
-    async def fetchmany(self, size: Optional[int] = None) -> list:
+    async def fetchmany(self, size=None):
         self._verify_fetch()
         if size is None:
             size = self._impl.arraysize
@@ -911,16 +911,16 @@ class AsyncCursor(BaseCursor):
             result.append(row)
         return result
 
-    async def fetchone(self) -> Any:
+    async def fetchone(self):
         self._verify_fetch()
         return await self._impl.fetch_next_row(self)
 
-    async def parse(self, statement: str) -> None:
+    async def parse(self, statement):
         self._verify_open()
         self._prepare(statement)
         await self._impl.parse(self)
 
-    async def scroll(self, value: int = 0, mode: str = "relative") -> None:
+    async def scroll(self, value=0, mode="relative"):
         self._verify_open()
         await self._impl.scroll(self, value, mode)
 
@@ -991,12 +991,12 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
                 parse_type = cparams['parse_type']
                 if type(parse_type) is str and parse_type.upper() in ['DM', 'MYSQL', 'TSQL']:
                     if parse_type.upper() == 'MYSQL':
-                        if compatible_mode == None:
+                        if compatible_mode is None:
                             self.compatible_module = MySQLCompatible_Mode()
                         self.parse_module = DMMySQLDialect_Adapter()
                         self.parse_stmt_func = _dmPython.parse_mysql_stmt
                     if parse_type.upper() == 'TSQL':
-                        if compatible_mode == None:
+                        if compatible_mode is None:
                             self.compatible_module = TSQLCompatible_Mode()
                         self.parse_stmt_func = _dmPython.parse_tsql_stmt
                 else:
@@ -1014,6 +1014,11 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
                     del cparams['add_quote_all']
                 else:
                     raise ValueError("The add_quote_all must be of bool type")
+
+            if 'database' in cparams:
+                schema = cparams['database']
+                cparams['schema'] = schema
+                del cparams['database']
 
             dbapi_conn = self.dbapi.connect(*cargs, **cparams)
 
@@ -1068,7 +1073,7 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
             )
 
     @classmethod
-    def get_pool_class(cls, url) -> type:
+    def get_pool_class(cls, url):
         async_fallback = url.query.get("async_fallback", False)
 
         if util.asbool(async_fallback):
@@ -1210,7 +1215,7 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
             if parameters != [] and parameters != None:
                 for i in range(len(parameters)):
                     list_element = parameters[i]
-                    if type(list_element) == list:
+                    if type(list_element) is list:
                         if len(list_element) == 0:
                             result_string = ''
                         else:
@@ -1249,14 +1254,14 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
             columns = len(parameters[0]) if parameters else 0
             for i in range(rows):
                 for j in range(columns):
-                    if type(parameters[i][j]) == datetime.datetime:
+                    if type(parameters[i][j]) is datetime.datetime:
                         temp = parameters[i][j]
                         str_temp = temp.strftime("%Y-%m-%d %H:%M:%S.%f %Z")
                         if 'UTC' in str_temp:
                             parameters[i][j] = str_temp.replace('UTC', '')
                         else:
                             parameters[i][j] = str_temp
-                    if type(parameters[i][j]) == list:
+                    if type(parameters[i][j]) is list:
                         list_element = parameters[i][j]
                         if len(list_element) == 0:
                             result_string = ''
@@ -1274,7 +1279,7 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
 
 class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
 
-    _cursor: AsyncCursor
+    _cursor = None
     __slots__ = ()
 
     @property
@@ -1292,7 +1297,7 @@ class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
         self._rows.clear()
         self._cursor.close()
 
-    def setinputsizes(self, *args: Any, **kwargs: Any) -> Any:
+    def setinputsizes(self, *args, **kwargs):
         return self._cursor.setinputsizes(*args, **kwargs)
 
     def _make_new_cursor(
@@ -1327,7 +1332,7 @@ class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
         self._rows.clear()
         return retval
 
-    def fetchone(self) -> Optional[Any]:
+    def fetchone(self):
         result = self._rows
         if self._cursor.description and not self.server_side:
             result = self._cursor.raw.fetchone()
@@ -1339,7 +1344,7 @@ class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
     def __enter__(self):
         return self
 
-    def __exit__(self, type_: Any, value: Any, traceback: Any) -> None:
+    def __exit__(self, type_, value, traceback):
         self.close()
 
 class AsyncAdapt_dmasync_ss_cursor(
@@ -1347,24 +1352,24 @@ class AsyncAdapt_dmasync_ss_cursor(
 ):
     __slots__ = ()
 
-    def close(self) -> None:
+    def close(self):
         if self._cursor is not None:
             self._cursor.close()
             self._cursor = None  # type: ignore
 
 class AsyncAdapt_dmasync_connection(AsyncAdapt_dbapi_connection):
-    def __init__(self, dbapi, connection):
-        super().__init__(dbapi, connection)
-        self.dbapi = dbapi
-        self._connection = connection
-
-    _connection: AsyncConnection
+    _connection = None
     __slots__ = ()
 
     thin = True
 
     _cursor_cls = AsyncAdapt_dmasync_cursor
     _ss_cursor_cls = None
+
+    def __init__(self, dbapi, connection):
+        super().__init__(dbapi, connection)
+        self.dbapi = dbapi
+        self._connection = connection
 
     @property
     def autocommit(self):
@@ -1404,22 +1409,22 @@ class AsyncAdapt_dmasync_connection(AsyncAdapt_dbapi_connection):
     def ss_cursor(self):
         return AsyncAdapt_dmasync_ss_cursor(self)
 
-    def xid(self, *args: Any, **kwargs: Any) -> Any:
+    def xid(self, *args, **kwargs):
         return self._connection.xid(*args, **kwargs)
 
-    def tpc_begin(self, *args: Any, **kwargs: Any) -> Any:
+    def tpc_begin(self, *args, **kwargs):
         return self.await_(self._connection.tpc_begin(*args, **kwargs))
 
-    def tpc_commit(self, *args: Any, **kwargs: Any) -> Any:
+    def tpc_commit(self, *args, **kwargs):
         return self.await_(self._connection.tpc_commit(*args, **kwargs))
 
-    def tpc_prepare(self, *args: Any, **kwargs: Any) -> Any:
+    def tpc_prepare(self, *args, **kwargs):
         return self.await_(self._connection.tpc_prepare(*args, **kwargs))
 
-    def tpc_recover(self, *args: Any, **kwargs: Any) -> Any:
+    def tpc_recover(self, *args, **kwargs):
         return self.await_(self._connection.tpc_recover(*args, **kwargs))
 
-    def tpc_rollback(self, *args: Any, **kwargs: Any) -> Any:
+    def tpc_rollback(self, *args, **kwargs):
         return self.await_(self._connection.tpc_rollback(*args, **kwargs))
 
 class AsyncAdaptFallback_dmasync_connection(
@@ -1428,7 +1433,7 @@ class AsyncAdaptFallback_dmasync_connection(
     __slots__ = ()
 
 class DMAdaptDBAPI:
-    def __init__(self, dmPython) -> None:
+    def __init__(self, dmPython):
         self.dmPython = dmPython
 
         for k, v in self.dmPython.__dict__.items():

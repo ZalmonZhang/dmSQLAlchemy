@@ -68,14 +68,14 @@ globalvars.set_var('RESERVED_WORDS', RESERVED_WORDS)
 class dmSession(Session):
     def execute(
         self,
-        statement: Executable,
-        params: Optional[_CoreAnyExecuteParams] = None,
+        statement,
+        params=None,
         *,
-        execution_options: OrmExecuteOptionsParameter = util.EMPTY_DICT,
-        bind_arguments: Optional[_BindArguments] = None,
-        _parent_execute_state: Optional[Any] = None,
-        _add_event: Optional[Any] = None,
-    ) -> Result[Any]:
+        execution_options=util.EMPTY_DICT,
+        bind_arguments=None,
+        _parent_execute_state=None,
+        _add_event=None,
+    ):
 
         if self.bind.dialect.parse_stmt_func is not None and not isinstance(statement, TextClause):
             if not isinstance(self, Session) and not isinstance(self, Connection):
@@ -99,13 +99,13 @@ class dmsessionmaker(sessionmaker):
 
     def __init__(
         self,
-        bind: Optional[_SessionBind] = None,
+        bind=None,
         *,
-        class_: Type[_S] = dmSession,  # type: ignore
-        autoflush: bool = True,
-        expire_on_commit: bool = True,
-        info: Optional[_InfoType] = None,
-        **kw: Any,
+        class_=dmSession,  # type: ignore
+        autoflush=True,
+        expire_on_commit=True,
+        info=None,
+        **kw,
     ):
         super().__init__(bind, class_=class_, autoflush=autoflush, expire_on_commit=expire_on_commit, info=info, **kw)
 
@@ -213,7 +213,12 @@ class DMDialect_Adapter:
             text += "\n OFFSET %s ROWS" % offset_str
 
         if fetch_clause is not None:
-            text += "\n FETCH FIRST %s%s ROWS %s" % (
+            text += "\n FETCH "
+            if select._fetch_clause is None and hasattr(fetch_clause,
+                                                        "approx_select") and fetch_clause.approx_select is True:
+                text += "APPROX "
+
+            text +="FIRST %s%s ROWS %s" % (
                 dialect.process(fetch_clause, **kw),
                 " PERCENT" if fetch_clause_options["percent"] else "",
                 "WITH TIES" if fetch_clause_options["with_ties"] else "ONLY",
@@ -251,11 +256,14 @@ class DMMySQLDialect_Adapter:
 
         return text
 
+class DMTSQLDialect_Adapter(DMDialect_Adapter):
+    pass
+
 class NoCompatible_Mode:
 
     def json_proc_decorator(self, func):
         def process(value):
-            if type(value) == dict or type(value) == list:
+            if type(value) is dict or type(value) is list:
                 return str(value)
             return value
 
@@ -265,7 +273,7 @@ class MySQLCompatible_Mode(NoCompatible_Mode):
 
     def json_proc_decorator(self, func):
         def process(value):
-            if type(value) == dict:
+            if type(value) is dict:
                 return value
             else:
                 return json.loads(value)

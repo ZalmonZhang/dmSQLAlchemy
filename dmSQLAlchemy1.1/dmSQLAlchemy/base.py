@@ -2,7 +2,7 @@ import re
 from .types import NUMBER
 from datetime import datetime
 from .extensions import globalvars
-from .types import colspecs, ischema_names
+from .types import colspecs, ischema_names, BYTE
 from sqlalchemy import util, sql, exc
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.engine import default, reflection
@@ -375,7 +375,12 @@ class DMCompiler(compiler.SQLCompiler):
 
     def function_argspec(self, fn, **kw):
         self.dialect.trace_process('DMCompiler', 'function_argspec', fn, **kw)
-        if len(fn.clauses) > 0 or fn.name.upper() not in NO_ARG_FNS:
+        if type(kw) is dict and 'filter_flag' in kw and kw['filter_flag']:
+            col_info = compiler.SQLCompiler.function_argspec(self, fn, **kw)
+            if col_info == '(*)':
+                col_info = '1 ELSE 0'
+            return "(CASE WHEN %s THEN " + col_info + " END)"
+        elif len(fn.clauses) > 0 or fn.name.upper() not in NO_ARG_FNS:
             return compiler.SQLCompiler.function_argspec(self, fn, **kw)
         else:
             return ""
@@ -383,13 +388,6 @@ class DMCompiler(compiler.SQLCompiler):
     def default_from(self):
         self.dialect.trace_process('DMCompiler', 'default_from')
         return " FROM DUAL"
-    
-    def _generate_generic_unary_operator(self, unary, opstring, **kw):
-        self.dialect.trace_process('DMCompiler', '_generate_generic_unary_operator', unary, opstring, **kw)
-        if opstring == 'EXISTS ':
-            rs = 'SELECT COUNT(*) FROM ' + unary.element._compiler_dispatch(self, **kw)
-            return 'CASE WHEN (' + rs + ' AS R_EXISTS) > 0 THEN 1 ELSE 0 END '
-        return opstring + unary.element._compiler_dispatch(self, **kw)    
 
     def visit_join(self, join, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_join', join, **kwargs)
@@ -774,17 +772,21 @@ class DMCompiler(compiler.SQLCompiler):
         self.dialect.trace_process('DMCompiler', 'visit_endswith_op_binary', binary, operator, **kw)
         return super(DMCompiler, self).visit_endswith_op_binary(binary, operator, **kw)
         
-    def visit_extract(self, extract, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_extract', extract, **kwargs)
-        super(DMCompiler, self).visit_extract(extract, **kwargs)
-        
     def visit_fromclause(self, fromclause, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_fromclause', fromclause, **kwargs)
         return super(DMCompiler, self).visit_fromclause(fromclause, **kwargs)
         
     def visit_funcfilter(self, funcfilter, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_funcfilter', funcfilter, **kwargs)
-        super(DMCompiler, self).visit_funcfilter(funcfilter, **kwargs)
+        if type(kwargs) is dict:
+            temp_kwargs = kwargs.copy()
+            temp_kwargs["filter_flag"] = True
+            return (funcfilter.func._compiler_dispatch(self, **temp_kwargs) %
+                    funcfilter.criterion._compiler_dispatch(self, **temp_kwargs))
+        else:
+            return "%s FILTER (WHERE %s)" % (
+                funcfilter.func._compiler_dispatch(self, **kwargs),
+                funcfilter.criterion._compiler_dispatch(self, **kwargs),
+            )
         
     def visit_function(self, func, add_to_result_map=None, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_function', func, add_to_result_map, **kwargs)
@@ -1289,10 +1291,6 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_label', label, name)
         return super(DMIdentifierPreparer, self).format_label(label, name)
         
-    def format_schema(self, name, quote=None):
-        self.dialect.trace_process('DMIdentifierPreparer', 'format_schema', name, quote)
-        return super(DMIdentifierPreparer, self).format_schema(name, quote)
-        
     def format_sequence(self, sequence, use_schema=True):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_sequence', sequence, use_schema)
         return super(DMIdentifierPreparer, self).format_sequence(sequence, use_schema)
@@ -1304,7 +1302,6 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     def format_table_seq(self, table, use_schema=True):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_table_seq', table, use_schema)
         return super(DMIdentifierPreparer, self).format_table_seq(table, use_schema)
-        
 
 class DMExecutionContext(default.DefaultExecutionContext):
     def fire_sequence(self, seq, type_):
@@ -1379,7 +1376,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
             escape_to_quote = self.dialect.parse_module.escape_to_quote
             if escape_quote in result_name:
                 result_name = result_name.replace(escape_quote, escape_to_quote)
-            if self._double_percents:
+            if self.dialect.identifier_preparer._double_percents:
                 result_name = result_name.replace("%", "%%")
             result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
 
@@ -1944,6 +1941,8 @@ class DMDialect(default.DefaultDialect):
                 coltype = sqltypes.Integer
             elif 'WITH TIME ZONE' in coltype:
                 coltype = TIMESTAMP(timezone = True)
+            elif coltype == 'BYTE':
+                coltype = BYTE
             else:
                 coltype = re.sub(r'\(\d+\)', '', coltype)
                 try:

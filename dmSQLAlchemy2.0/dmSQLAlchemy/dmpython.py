@@ -10,14 +10,15 @@ from sqlalchemy.exc import DBAPIError
 from importlib.metadata import version
 from sqlalchemy import types as sqltypes, util, exc
 from .base import DMCompiler, DMDialect, DMExecutionContext
-from .extensions import DMDialect_Adapter, DMMySQLDialect_Adapter, Quote_Method, No_Quote_Method, \
-    NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode, OracleCompatible_Mode, globalvars
+from .extensions import (DMDialect_Adapter, DMMySQLDialect_Adapter, DMTSQLDialect_Adapter, Quote_Method,
+                         No_Quote_Method, NoCompatible_Mode, MySQLCompatible_Mode, TSQLCompatible_Mode,
+                         OracleCompatible_Mode, globalvars)
 from sqlalchemy.engine import cursor as _cursor
 from .types import _DMBinary, _DMBoolean, _DMChar, _DMDate, _DMEnum, \
      _DMInteger, _DMInterval, _DMLongVarchar, _DMNumeric, \
      _DMNVarChar, _DMRowid, _DMString, _DMText, _DMUnicodeText, INTERVAL, \
      LONGVARCHAR, ROWID, _DMBLOB, DMBINARY, ARRAYCLOB, JSON, JSONIndexType, JSONPathType,\
-     VECTORTYPE, VECTOR
+     VECTORTYPE, VECTOR, _DMUUID
 
 class DMCompiler_dmPython(DMCompiler):
 
@@ -86,7 +87,7 @@ class DMExecutionContext_dmPython(DMExecutionContext):
                                         pattern = re.compile(r'^' + positiontup[i] + r'_\d+$')
                                         result = [item for item in keys_list if pattern.match(item)]
                                         index = (index - 1 + len(result))
-                                if (type(compiled_param) == dict):
+                                if type(compiled_param) is dict:
                                     param[index] = out_parameters[name]
 
     def set_output_val(self, value):
@@ -114,7 +115,7 @@ class DMExecutionContext_dmPython(DMExecutionContext):
             if self.support_stream:
                 for j in range(numcols):
                     temp_list = []
-                    if (type(self.out_parameters[f"ret_{j}"]) != list):
+                    if type(self.out_parameters[f"ret_{j}"]) is not list:
                         temp_list.append(self.out_parameters[f"ret_{j}"])
                     else:
                         temp_list = self.out_parameters[f"ret_{j}"]
@@ -207,7 +208,7 @@ class DMDialect_dmPython(DMDialect):
     def my_json_serializer(self,value):
         return value
 
-    _json_serializer=my_json_serializer
+    _json_serializer = my_json_serializer
 
     colspecs = {
         sqltypes.Numeric: _DMNumeric,
@@ -238,6 +239,7 @@ class DMDialect_dmPython(DMDialect):
         ROWID: _DMRowid,
         sqltypes.ARRAY: ARRAYCLOB,
         VECTORTYPE: VECTOR,
+        sqltypes.Uuid: _DMUUID,
     }
 
     execute_sequence_format = list
@@ -245,8 +247,8 @@ class DMDialect_dmPython(DMDialect):
     def __init__(self,
                  auto_convert_lobs=True,
                  coerce_to_decimal=True,
-                 autocommit = False,
-                 connection_timeout = 0,
+                 autocommit=False,
+                 connection_timeout=0,
                  arraysize=50,
                  **kwargs):
         DMDialect.__init__(self, **kwargs)
@@ -327,6 +329,7 @@ class DMDialect_dmPython(DMDialect):
                     elif parse_type.upper() == 'TSQL':
                         if compatible_mode == None:
                             self.compatible_module = TSQLCompatible_Mode()
+                        self.parse_module = DMTSQLDialect_Adapter()
                         self.parse_stmt_func = parse_tsql_stmt
                 else:
                     raise ValueError("The parse_type must be of string type and specified within the scope of DM, MYSQL and TSQL")
@@ -560,14 +563,14 @@ class DMDialect_dmPython(DMDialect):
         columns = len(parameters[0]) if parameters else 0
         for i in range(rows):
             for j in range(columns):
-                if type(parameters[i][j]) == datetime.datetime:
+                if type(parameters[i][j]) is datetime.datetime:
                     temp = parameters[i][j]
                     str_temp = temp.strftime("%Y-%m-%d %H:%M:%S.%f %Z")
                     if 'UTC' in str_temp:
                         parameters[i][j] = str_temp.replace('UTC', '')
                     else:
                         parameters[i][j] = str_temp
-                if type(parameters[i][j]) == list:
+                if type(parameters[i][j]) is list:
                     list_element = parameters[i][j]
                     if len(list_element) == 0:
                         result_string = ''

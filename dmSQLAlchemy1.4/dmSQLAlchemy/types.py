@@ -87,7 +87,7 @@ class INTERVAL(Interval):
                  minute_precision=None,
                  second_precision=None,
                  native = True):
-        super(Interval, self).__init__()
+        super(INTERVAL, self).__init__()
         self.native = native
         self.year_precision = year_precision
         self.to_month = to_month
@@ -160,13 +160,7 @@ class _LOBMixin(object):
 class _NativeUnicodeMixin(object):
     if util.py2k:
         def bind_processor(self, dialect):
-                return super(
-                    _NativeUnicodeMixin, self).bind_processor(dialect)
-
-    # we apply a connection output handler that returns
-    # unicode in all cases, so the "native_unicode" flag
-    # will be set for the default String.result_processor.
-
+            return super(_NativeUnicodeMixin, self).bind_processor(dialect)
 
 class _DMChar(_NativeUnicodeMixin, sqltypes.CHAR):
     def get_dbapi_type(self, dbapi):
@@ -321,7 +315,6 @@ class _DMInteger(sqltypes.Integer):
     def result_processor(self, dialect, coltype):
         def to_int(val):
             if val is not None:
-                print(val)
                 val = int(val)
             return val
         return to_int

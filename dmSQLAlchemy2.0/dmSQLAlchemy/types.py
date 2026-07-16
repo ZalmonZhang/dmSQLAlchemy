@@ -59,7 +59,7 @@ class ARRAYCLOB(ARRAY):
 
     def bind_processor(self, dialect):
         def process(value):
-            if type(value) == list:
+            if type(value) is list:
                 if len(value) == 0:
                     result_string = ''
                 else:
@@ -107,8 +107,8 @@ class INTERVAL(Interval):
                  hour_precision=None,
                  minute_precision=None,
                  second_precision=None,
-                 native: bool = True):
-        super(Interval, self).__init__()
+                 native=True):
+        super(INTERVAL, self).__init__()
         self.native = native
         self.year_precision = year_precision
         self.to_month = to_month
@@ -183,7 +183,7 @@ class _NativeUnicodeMixin(object):
 
 class _DMChar(_NativeUnicodeMixin, sqltypes.CHAR):
     def get_dbapi_type(self, dbapi):
-        return dbapi.FIXED_STRING
+        return dbapi.STRING
     
 class CHARACTER(sqltypes.CHAR):
     pass
@@ -228,7 +228,7 @@ class BIT(sqltypes.TypeEngine):
 class TIMESTAMP(sqltypes.TIMESTAMP):
     __visit_name__ = 'DMTIMESTAMP'
     
-    def __init__(self, timezone = False, local_timezone = False):
+    def __init__(self, timezone=False, local_timezone=False):
         self.timezone = timezone
         self.local_timezone = False
         
@@ -423,7 +423,11 @@ class _DMInterval(INTERVAL):
 class _DMRowid(ROWID):
     def get_dbapi_type(self, dbapi):
         return dbapi.ROWID
-    
+
+class _DMUUID(sqltypes.Uuid):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.STRING
+
 colspecs = {
     sqltypes.Boolean: _DMBoolean,
     sqltypes.Interval: INTERVAL,

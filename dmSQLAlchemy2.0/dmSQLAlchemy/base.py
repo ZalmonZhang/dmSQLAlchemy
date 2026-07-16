@@ -5,7 +5,8 @@ import sqlalchemy.exc as exc
 from datetime import datetime
 from .extensions import globalvars
 from collections import defaultdict
-from typing import Any, TypeVar, Optional
+from typing import TypeVar
+from sqlalchemy.sql.elements import Tuple
 from .types import colspecs, ischema_names
 from sqlalchemy.engine.base import Connection
 from sqlalchemy import util, sql, text, Identity
@@ -13,11 +14,11 @@ from sqlalchemy.engine import default, reflection
 from sqlalchemy.engine import ObjectKind, ObjectScope
 from sqlalchemy.sql import compiler, visitors, expression, util as sql_util
 from sqlalchemy.sql import operators as sql_operators
+from sqlalchemy.sql._typing import is_sql_compiler
 from sqlalchemy.engine.reflection import ReflectionDefaults
 from sqlalchemy import types as sqltypes, schema as sa_schema
-from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
-    BLOB, CLOB, TIME, TIMESTAMP, FLOAT, BIGINT, String, DOUBLE_PRECISION, REAL, INTEGER
-from .types import NUMBER, VECTOR
+from sqlalchemy.types import TIMESTAMP, REAL, CLOB, BLOB
+from .types import NUMBER, VECTOR, BYTE
 from sqlalchemy.sql.visitors import InternalTraversal
 
 
@@ -26,6 +27,21 @@ _S = TypeVar("_S", bound="Session")
 
 NO_ARG_FNS = set('UID CURRENT_DATE SYSDATE USER '
                  'CURRENT_TIME CURRENT_TIMESTAMP'.split())
+
+def dynamic_cache(cache_decorator, enable_cache):
+    def decorator(func):
+        cache_fn = cache_decorator(func)
+
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+
+            if getattr(self, enable_cache, False):
+                return cache_fn(self, *args, **kwargs)
+            else:
+                return func(self, *args, **kwargs)
+
+        return wrapper
+    return decorator
 
 class DMTypeCompiler(compiler.GenericTypeCompiler):
     def visit_datetime(self, type_, **kw):
@@ -308,16 +324,22 @@ class DMTypeCompiler(compiler.GenericTypeCompiler):
         self.dialect.trace_process('DMTypeCompiler', 'visit_real', type_, **kw)
         return super(DMTypeCompiler, self).visit_real(type_, **kw)
 
-    def visit_JSON(self,type_,**kw):
+    def visit_JSON(self, type_, **kw):
         return "JSON"
 
-    def visit_VECTOR(self,type_,**kw):
+    def visit_VECTOR(self, type_, **kw):
         if type_.dim is not None or type_.format is not None:
             if type_.dim is not None:
+                type_str = f"VECTOR({type_.dim}, "
                 if type_.format is not None:
-                    return "VECTOR(%s, %s)" % (type_.dim, type_.format)
+                    type_str += f"{type_.format}, "
                 else:
-                    return "VECTOR(%s)" % type_.dim
+                    type_str += f"FLOAT32, "
+                if type_.storage_format is not None:
+                    type_str += f"{type_.storage_format})"
+                else:
+                    type_str += f"DENSE)"
+            return type_str
         else:
             return "VECTOR"
 
@@ -401,7 +423,12 @@ class DMCompiler(compiler.SQLCompiler):
 
     def function_argspec(self, fn, **kw):
         self.dialect.trace_process('DMCompiler', 'function_argspec', fn, **kw)
-        if len(fn.clauses) > 0 or fn.name.upper() not in NO_ARG_FNS:
+        if type(kw) is dict and 'filter_flag' in kw and kw['filter_flag']:
+            col_info = compiler.SQLCompiler.function_argspec(self, fn, **kw)
+            if col_info == '(*)':
+                col_info = '1 ELSE 0'
+            return "(CASE WHEN %s THEN " + col_info + " END)"
+        elif len(fn.clauses) > 0 or fn.name.upper() not in NO_ARG_FNS:
             return compiler.SQLCompiler.function_argspec(self, fn, **kw)
         else:
             return ""
@@ -412,13 +439,6 @@ class DMCompiler(compiler.SQLCompiler):
 
     def visit_aggregate_strings_func(self, fn, **kw):
         return "LISTAGG%s" % self.function_argspec(fn, **kw)
-    
-    def _generate_generic_unary_operator(self, unary, opstring, **kw):
-        self.dialect.trace_process('DMCompiler', '_generate_generic_unary_operator', unary, opstring, **kw)
-        if opstring == 'EXISTS ':
-            rs = 'SELECT COUNT(*) FROM ' + unary.element._compiler_dispatch(self, **kw)
-            return 'CASE WHEN (' + rs + ' AS R_EXISTS) > 0 THEN 1 ELSE 0 END '
-        return opstring + unary.element._compiler_dispatch(self, **kw)    
 
     def visit_join(self, join, from_linter=None, **kwargs):
         self.dialect.trace_process('DMCompiler', 'visit_join', join, from_linter, **kwargs)
@@ -539,101 +559,22 @@ class DMCompiler(compiler.SQLCompiler):
     def _TODO_visit_compound_select(self, select):
         pass
 
-    def visit_select(self, select, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_select', select, **kwargs)
-        """Look for ``LIMIT`` and OFFSET in a select statement, and if
-        so tries to wrap it in a subquery with ``rownum`` criterion.
-        """
+    def _vector_similarity_search_clause(self, select, **kw):
+        search_params = select._search_params
+        if search_params is None:
+            return ""
+        target_accuracy = search_params.get("target_accuracy", None)
+        ef_search = search_params.get("ef", None)
+        nprobe = search_params.get("nprobe", None)
 
-        if not getattr(select, '_dm_visit', None):
-            if not self.dialect.use_ansi:
-                froms = self._display_froms_for_select(
-                    select, kwargs.get('asfrom', False))
-                whereclause = self._get_nonansi_join_whereclause(froms)
-                if whereclause is not None:
-                    select = select.where(whereclause)
-                    select._dm_visit = True
-
-            limit_clause = select._limit_clause
-            offset_clause = select._offset_clause
-            if limit_clause is not None or offset_clause is not None:
-                kwargs['select_wraps_for'] = select
-                select = select._generate()
-                select._dm_visit = True
-
-                # Wrap the middle select and add the hint
-                limitselect = sql.select([c for c in select.c])
-                if limit_clause is not None and \
-                    self.dialect.optimize_limits and \
-                        select._simple_int_limit:
-                    limitselect = limitselect.prefix_with(
-                        "/*+ FIRST_ROWS(%d) */" %
-                        select._limit)
-
-                limitselect._dm_visit = True
-                limitselect._is_wrapper = True
-
-                # add expressions to accommodate FOR UPDATE OF
-                for_update = select._for_update_arg
-                if for_update is not None and for_update.of:
-                    for_update = for_update._clone()
-                    for_update._copy_internals()
-
-                    for elem in for_update.of:
-                        select.append_column(elem)
-
-                    adapter = sql_util.ClauseAdapter(select)
-                    for_update.of = [
-                        adapter.traverse(elem)
-                        for elem in for_update.of]
-
-                # If needed, add the limiting clause
-                if limit_clause is not None:
-                    if not self.dialect.use_binds_for_limits:
-                        # use simple int limits, will raise an exception
-                        # if the limit isn't specified this way
-                        max_row = select._limit
-
-                        if offset_clause is not None:
-                            max_row += select._offset
-                        max_row = sql.literal_column("%d" % max_row)
-                    else:
-                        max_row = limit_clause
-                        if offset_clause is not None:
-                            max_row = max_row + offset_clause
-                    limitselect.append_whereclause(
-                        sql.literal_column("ROWNUM") <= max_row)
-
-                # If needed, add the dm_rn, and wrap again with offset.
-                if offset_clause is None:
-                    limitselect._for_update_arg = for_update
-                    select = limitselect
-                else:
-                    limitselect = limitselect.column(
-                        sql.literal_column("ROWNUM").label("dm_rn"))
-                    limitselect._dm_visit = True
-                    limitselect._is_wrapper = True
-
-                    offsetselect = sql.select(
-                        [c for c in limitselect.c if c.key != 'dm_rn'])
-                    offsetselect._dm_visit = True
-                    offsetselect._is_wrapper = True
-
-                    if for_update is not None and for_update.of:
-                        for elem in for_update.of:
-                            if limitselect.corresponding_column(elem) is None:
-                                limitselect.append_column(elem)
-
-                    if not self.dialect.use_binds_for_limits:
-                        offset_clause = sql.literal_column(
-                            "%d" % select._offset)
-                    offsetselect.append_whereclause(
-                        sql.literal_column("dm_rn") > offset_clause)
-
-                    offsetselect._for_update_arg = for_update
-                    select = offsetselect
-
-        return compiler.SQLCompiler.visit_select(self, select, **kwargs)
+        search_str = ""
+        if target_accuracy is not None:
+            search_str += f" WITH TARGET ACCURACY {target_accuracy}"
+        if nprobe is not None:
+            search_str += f" WITH TARGET ACCURACY PARAMETERS (NEIGHBOR PARTITION PROBES {nprobe})"
+        if ef_search is not None:
+            search_str += f" WITH TARGET ACCURACY PARAMETERS (EFSEARCH {ef_search})"
+        return search_str
 
     def limit_clause(self, select, **kw):
         if select._fetch_clause_options is None:
@@ -649,6 +590,8 @@ class DMCompiler(compiler.SQLCompiler):
         text = ""
 
         text += self.dialect.parse_module.limit_offset_clause(self, select, fetch_clause, fetch_clause_options, **kw)
+        if hasattr(select, "_is_search_flag") and select._is_search_flag:
+            text += self._vector_similarity_search_clause(select, **kw)
 
         return text
 
@@ -754,7 +697,7 @@ class DMCompiler(compiler.SQLCompiler):
                                    extra_froms, **kw)
         return super(DMCompiler, self).update_tables_clause(update_stmt, from_table,
                                                             extra_froms, **kw)
-        
+
     def visit_alias(
         self,
         alias,
@@ -770,7 +713,7 @@ class DMCompiler(compiler.SQLCompiler):
     ):
         self.dialect.trace_process('DMCompiler', 'visit_alias', alias, asfrom, ashint, iscrud, fromhints, subquery, lateral, enclosing_alias, from_linter, **kwargs)
         return super(DMCompiler, self).visit_alias(alias, asfrom, ashint, iscrud, fromhints, subquery, lateral, enclosing_alias, from_linter, **kwargs)
-        
+
     def visit_between_op_binary(self, binary, operator, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_between_op_binary', binary, operator, **kw)
         return super(DMCompiler, self).visit_between_op_binary(binary, operator, **kw)
@@ -879,12 +822,16 @@ class DMCompiler(compiler.SQLCompiler):
         return super(DMCompiler, self).visit_fromclause(fromclause, **kwargs)
         
     def visit_funcfilter(self, funcfilter, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_funcfilter', funcfilter, **kwargs)
-        super(DMCompiler, self).visit_funcfilter(funcfilter, **kwargs)
-        
-    def visit_function(self, func, add_to_result_map=None, **kwargs):
-        self.dialect.trace_process('DMCompiler', 'visit_function', func, add_to_result_map, **kwargs)
-        return super(DMCompiler, self).visit_function(func, add_to_result_map, **kwargs)
+        if type(kwargs) is dict:
+            temp_kwargs = kwargs.copy()
+            temp_kwargs["filter_flag"] = True
+            return (funcfilter.func._compiler_dispatch(self, **temp_kwargs) %
+                    funcfilter.criterion._compiler_dispatch(self, **temp_kwargs))
+        else:
+            return "%s FILTER (WHERE %s)" % (
+                funcfilter.func._compiler_dispatch(self, **kwargs),
+                funcfilter.criterion._compiler_dispatch(self, **kwargs),
+            )
     
     def visit_function_as_comparison_op_binary(self, element, operator, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_function_as_comparison_op_binary', element, operator, **kw)
@@ -1010,49 +957,16 @@ class DMCompiler(compiler.SQLCompiler):
     
     def visit_scalar_function_column(self, element, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_scalar_function_column', element, **kw)
-        return super(DMCompiler, self).visit_scalar_function_column(element, **kw)        
-        
-    def visit_select(
-        self,
-        select_stmt,
-        asfrom=False,
-        insert_into=False,
-        fromhints=None,
-        compound_index=None,
-        select_wraps_for=None,
-        lateral=False,
-        from_linter=None,
-        **kwargs
-    ):    
-        self.dialect.trace_process('DMCompiler', 'visit_select', 
-                                   select_stmt,
-                                   asfrom,
-                                   insert_into,
-                                   fromhints,
-                                   compound_index,
-                                   select_wraps_for,
-                                   lateral,
-                                   from_linter,
-                                   **kwargs)
-        return super(DMCompiler, self).visit_select(
-                                   select_stmt,
-                                   asfrom,
-                                   insert_into,
-                                   fromhints,
-                                   compound_index,
-                                   select_wraps_for,
-                                   lateral,
-                                   from_linter,
-                                   **kwargs)
-        
+        return super(DMCompiler, self).visit_scalar_function_column(element, **kw)
+
     def visit_startswith_op_binary(self, binary, operator, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_startswith_op_binary', binary, operator, **kw)
         return super(DMCompiler, self).visit_startswith_op_binary(binary, operator, **kw)
-    
+
     def visit_subquery(self, subquery, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_subquery', subquery, **kw)
         return super(DMCompiler, self).visit_subquery(subquery, **kw)
-        
+
     def visit_table(
         self,
         table,
@@ -1104,11 +1018,92 @@ class DMCompiler(compiler.SQLCompiler):
                                    taf, compound_index,
                                    asfrom, parens, **kw)
         return super(DMCompiler, self).visit_text_as_from(taf, compound_index, asfrom, parens, **kw)
-    
-    def visit_tuple(self, clauselist, **kw):
-        self.dialect.trace_process('DMCompiler', 'visit_tuple', clauselist, **kw)
-        return super(DMCompiler, self).visit_tuple(clauselist, **kw)        
-        
+
+    def _get_tuple_list(self, tuple, **kw):
+        return [
+            s
+            for s in (c._compiler_dispatch(self, **kw) for c in tuple.clauses)
+            if s
+        ]
+
+    def _resolve_param(self, param_value, tuple, i):
+        if param_value == '?':
+            return tuple.clauses[i].value
+        else:
+            return param_value
+
+    def _dm_tuple_op(self, left_tuple, right_tuple, opstring, eager_grouping, **kw):
+        kw["eager_grouping"] = eager_grouping
+        left_list = self._get_tuple_list(left_tuple, **kw)
+        right_list = self._get_tuple_list(right_tuple, **kw)
+        if opstring in [' = ', ' != ']:
+            if right_list[0] == 'NULL':
+                op_str = "(%s IS %s "
+            else:
+                op_str = "(%s = %s "
+            result = op_str % (left_list[0], right_list[0])
+            for i in range(len(left_list) - 1):
+                if right_list[i + 1] == 'NULL':
+                    op_str = "AND %s IS %s "
+                else:
+                    op_str = "AND %s = %s "
+                result += op_str % (left_list[i + 1], right_list[i + 1])
+            if opstring == ' != ':
+                result = ' NOT ' + result
+        else:
+            if opstring == ' > ':
+                last_op_str = op_str = ' > '
+            elif opstring == ' < ':
+                last_op_str = op_str = ' > '
+            elif opstring == ' >= ':
+                op_str = ' > '
+                last_op_str = ' >= '
+            elif opstring == ' <= ':
+                op_str = ' < '
+                last_op_str = ' <= '
+            result = "(%s%s%s " % (left_list[0], op_str, right_list[0])
+            for i in range(len(left_list) - 1):
+                result += "OR (%s = %s " % (self._resolve_param(left_list[0], left_tuple, 0),
+                                            self._resolve_param(right_list[0], right_tuple, 0))
+                for j in range(i):
+                    result += "AND %s = %s " % (self._resolve_param(left_list[j + 1], left_tuple, j + 1),
+                                                self._resolve_param(right_list[j + 1], right_tuple, j + 1))
+                if i == (len(left_list) - 2):
+                    result += "AND %s%s%s) " % (left_list[i + 1], last_op_str, right_list[i + 1])
+                else:
+                    result += "AND %s%s%s) " % (left_list[i + 1], op_str, right_list[i + 1])
+        result += ')'
+        return result
+
+    def _generate_generic_binary(
+        self,
+        binary,
+        opstring,
+        eager_grouping=False,
+        **kw,
+    ) -> str:
+        _in_operator_expression = kw.get("_in_operator_expression", False)
+
+        kw["_in_operator_expression"] = True
+        kw["_binary_op"] = binary.operator
+        op_list = [' > ', ' = ', ' < ', ' >= ', ' <= ', ' != ']
+        if isinstance(binary.left, Tuple) and isinstance(binary.right, Tuple) and type(opstring) is str and opstring in op_list:
+            text = self._dm_tuple_op(binary.left, binary.right, opstring, eager_grouping)
+        else:
+            text = (
+                binary.left._compiler_dispatch(
+                    self, eager_grouping=eager_grouping, **kw
+                )
+                + opstring
+                + binary.right._compiler_dispatch(
+                    self, eager_grouping=eager_grouping, **kw
+                )
+            )
+
+        if _in_operator_expression and eager_grouping:
+            text = "(%s)" % text
+        return text
+
     def visit_typeclause(self, typeclause, **kw):
         self.dialect.trace_process('DMCompiler', 'visit_typeclause', typeclause, **kw)
         return super(DMCompiler, self).visit_typeclause(typeclause, **kw)
@@ -1202,6 +1197,41 @@ class DMCompiler(compiler.SQLCompiler):
 
     def visit_json_path_getitem_op_binary(self, binary, operator, **kw):
         return self._render_json_extract_from_binary(binary, operator, **kw)
+
+    def visit_regexp_match_op_binary(self, binary, operator, **kw):
+        string = self.process(binary.left, **kw)
+        pattern = self.process(binary.right, **kw)
+        flags = binary.modifiers["flags"]
+        if flags is None:
+            return "REGEXP_LIKE(%s, %s)" % (string, pattern)
+        else:
+            return "REGEXP_LIKE(%s, %s, %s)" % (
+                string,
+                pattern,
+                self.render_literal_value(flags, sqltypes.STRINGTYPE),
+            )
+
+    def visit_not_regexp_match_op_binary(self, binary, operator, **kw):
+        return "NOT %s" % self.visit_regexp_match_op_binary(
+            binary, operator, **kw
+        )
+
+    def visit_regexp_replace_op_binary(self, binary, operator, **kw):
+        string = self.process(binary.left, **kw)
+        pattern_replace = self.process(binary.right, **kw)
+        flags = binary.modifiers["flags"]
+        if flags is None:
+            return "REGEXP_REPLACE(%s, %s)" % (
+                string,
+                pattern_replace,
+            )
+        else:
+            return "REGEXP_REPLACE(%s, %s, %s)" % (
+                string,
+                pattern_replace,
+                self.render_literal_value(flags, sqltypes.STRINGTYPE),
+            )
+
 
 class DMDDLCompiler(compiler.DDLCompiler):
     has_out_parameters = False
@@ -1481,7 +1511,7 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     
         return tuple([self.quote_identifier(i) for i in ids if i is not None])
 
-    def quote(self, ident: str, force: Any = None) -> str:
+    def quote(self, ident, force=None):
         if force is not None:
             util.warn_deprecated(
                 "The IdentifierPreparer.quote.force parameter is "
@@ -1505,7 +1535,7 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
         else:
             return self.dialect.quote_module.return_quote_str(self, ident)
 
-    def quote_identifier(self, value: str) -> str:
+    def quote_identifier(self, value):
 
         value = value.replace(self.dialect.parse_module.escape_quote, self.dialect.parse_module.escape_to_quote)
         if self._double_percents:
@@ -1520,7 +1550,7 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     def format_label(self, label, name=None):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_label', label, name)
         return super(DMIdentifierPreparer, self).format_label(label, name)
-        
+
     def format_schema(self, name):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_schema', name)
         return super(DMIdentifierPreparer, self).format_schema(name)
@@ -1536,7 +1566,6 @@ class DMIdentifierPreparer(compiler.IdentifierPreparer):
     def format_table_seq(self, table, use_schema=True):
         self.dialect.trace_process('DMIdentifierPreparer', 'format_table_seq', table, use_schema)
         return super(DMIdentifierPreparer, self).format_table_seq(table, use_schema)
-
 
 class DMExecutionContext(default.DefaultExecutionContext):
     def fire_sequence(self, seq, type_):
@@ -1604,7 +1633,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
             escape_to_quote = self.dialect.parse_module.escape_to_quote
             if escape_quote in result_name:
                 result_name = result_name.replace(escape_quote, escape_to_quote)
-            if self._double_percents:
+            if self.dialect.identifier_preparer._double_percents:
                 result_name = result_name.replace("%", "%%")
             result_name = self.dialect.parse_module.initial_quote + result_name + self.dialect.parse_module.final_quote
 
@@ -1641,7 +1670,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
         compiled_params = self.compiled_parameters[0]
 
         if self.executemany == True:
-            if self.out_parameters != None or len(self.out_parameters) == 0:
+            if self.out_parameters is not None or len(self.out_parameters) == 0:
                 if len(self.inserted_primary_key_rows) == 1:
                     result = []
                     for i in range(len(self.inserted_primary_key_rows[0])):
@@ -1655,7 +1684,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
             columns_autoinc_first = table.primary_key.columns_autoinc_first
             identity_flag = False
             for col in columns_autoinc_first:
-                if col.autoincrement == True or col.identity != None or (hasattr(col, 'server_default') and col.server_default != None):
+                if col.autoincrement is True or col.identity is not None or (hasattr(col, 'server_default') and col.server_default is not None):
                     identity_flag = True
                     break
 
@@ -1674,7 +1703,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
                     temp_params = {}
                     if len(result) != 1:
                         for i in range(len(primary_columns)):
-                            if hasattr(primary_columns[i], 'key') and primary_columns[i].key != None:
+                            if hasattr(primary_columns[i], 'key') and primary_columns[i].key is not None:
                                 temp_params[primary_columns[i].key] = result[i]
                             else:
                                 temp_params[primary_columns[i].name] = result[i]
@@ -1685,7 +1714,7 @@ class DMExecutionContext(default.DefaultExecutionContext):
                         self.compiled.compile_state.statement.table._autoincrement_column = _autoincrement_column
                         return self.inserted_primary_key
                     else:
-                        if hasattr(primary_columns[0], 'key') and primary_columns[0].key != None:
+                        if hasattr(primary_columns[0], 'key') and primary_columns[0].key is not None:
                             temp_params[primary_columns[0].key] = result[0]
                         else:
                             temp_params[primary_columns[0].name] = result[0]
@@ -1711,6 +1740,36 @@ class DMExecutionContext(default.DefaultExecutionContext):
     def _use_server_side_cursor(self):
         self.dialect.trace_process('DMExecutionContext', '_use_server_side_cursor')
         return super(DMExecutionContext, self)._use_server_side_cursor()
+
+    def fetchall_for_returning(self, cursor, *, _internal=False):
+        compiled = self.compiled
+        if (
+            not _internal
+            and compiled is None
+            or not is_sql_compiler(compiled)
+            or not compiled._dm_returning
+        ):
+            raise NotImplementedError(
+                "execution context was not prepared for DM RETURNING"
+            )
+
+        numcols = len(self.out_parameters)
+
+        result = list(
+            zip(
+                *[
+                    [
+                        val
+                        for stmt_result in self.out_parameters[
+                            f"ret_{j}"
+                        ]
+                        for val in (stmt_result if type(stmt_result) is list else [stmt_result] or ())
+                    ]
+                    for j in range(numcols)
+                ]
+            )
+        )
+        return result
 
 
 class DMDialect(default.DefaultDialect):
@@ -1745,7 +1804,7 @@ class DMDialect(default.DefaultDialect):
     delete_returning = True
     insert_returning = True
     insert_executemany_returning = True
-    
+    insert_executemany_returning_sort_by_parameter_order = True
     supports_trace = False
     supports_trace_params = False
     outfile = None
@@ -1785,7 +1844,8 @@ class DMDialect(default.DefaultDialect):
         self.optimize_limits = optimize_limits
         self.use_binds_for_limits = use_binds_for_limits
         self.exclude_tablespaces = exclude_tablespaces
-        
+        self._enable_cache = True
+
         if self.supports_trace:
             self.outfile = open('dmSQLAlchemy_trace.log', 'a')
 
@@ -1796,7 +1856,19 @@ class DMDialect(default.DefaultDialect):
             self.server_version_info > (10, )
         )
         self.default_schema_name = self._get_default_schema_name(connection)
-        
+
+    @property
+    def enable_cache(self):
+        return self._enable_cache
+
+    @enable_cache.setter
+    def enable_cache(self, value):
+        if not isinstance(value, bool):
+            raise ValueError("enable_cache must be a boolean (True or False)")
+
+        od_value = self._enable_cache
+        self._enable_cache = value
+
     def trace_process(self, cls_str=None, func_str=None, *args, **kws):
         if not self.supports_trace:
             return
@@ -1845,12 +1917,17 @@ class DMDialect(default.DefaultDialect):
     def resort_output_params(self, parameters, context):
         dict_len = len(context.out_parameters)
         poslist = []
-        for k in range(dict_len):
-            for j in range(len(parameters)):
+        for j in range(len(parameters)):
+            for k in range(dict_len):
                 if parameters[j] == context.out_parameters['ret_' + str(k)]:
                     poslist.append(j)
                     break
+        if poslist == []:
+            for i in context.temp_poslist:
+                parameters[i] = None
+            return context.temp_poslist, parameters
         if poslist[-1] - poslist[0] == dict_len - 1:
+            context.temp_poslist = poslist
             return poslist, parameters
         else:
             last_pos = poslist[0]
@@ -1874,10 +1951,10 @@ class DMDialect(default.DefaultDialect):
 
     def do_execute(self, cursor, statement, parameters, context=None):
         self.trace_process('DMDialect', 'do_execute', cursor, statement, parameters, context)
-        if parameters != [] and parameters != None:
+        if parameters != [] and parameters is not None:
             for i in range(len(parameters)):
                 list_element = parameters[i]
-                if type(list_element) == list:
+                if type(list_element) is list:
                     if len(list_element) == 0:
                         result_string = ''
                     else:
@@ -1887,8 +1964,8 @@ class DMDialect(default.DefaultDialect):
         version_info = globalvars.get_var('DMPYTHON_VERSION').split(".")
         if int(version_info[0]) > 2 or (int(version_info[0]) == 2 and int(version_info[1]) > 5) or (
                 int(version_info[0]) == 2 and int(version_info[1]) == 5 and int(version_info[2]) > 9):
-            if context != None:
-                if context.out_parameters != None:
+            if context is not None:
+                if context.out_parameters is not None:
                     if context.compiled is not None:
                         if hasattr(context.compiled, '_dm_returning'):
                             if context.compiled._dm_returning:
@@ -1929,8 +2006,8 @@ class DMDialect(default.DefaultDialect):
         self.trace_process('DMDialect', 'set_isolation_level', connection, level)
         raise NotImplementedError("implemented by dm dialect")
 
-    @reflection.cache
-    def has_table(self, connection, table_name, schema = None, dblink = None, **kw):
+    @dynamic_cache(reflection.cache, "_enable_cache")
+    def has_table(self, connection, table_name, schema=None, dblink=None, **kw):
         self.trace_process('DMDialect', 'has_table', connection, table_name, schema)
 
         name = self.denormalize_name(table_name),
@@ -1943,8 +2020,8 @@ class DMDialect(default.DefaultDialect):
                     WHERE tables_and_views.table_name = :name AND tables_and_views.owner = :schema_name""").bindparams(name = name[0], schema_name = schema_name))
         return cursor.fetchone() is not None
 
-    @reflection.cache
-    def has_sequence(self, connection, sequence_name, schema = None, dblink = None, **kw):
+    @dynamic_cache(reflection.cache, "_enable_cache")
+    def has_sequence(self, connection, sequence_name, schema=None, dblink=None, **kw):
         self.trace_process('DMDialect', 'has_sequence', connection, sequence_name, schema)
 
         schema = self.denormalize_name(schema or self.default_schema_name)
@@ -2094,7 +2171,7 @@ class DMDialect(default.DefaultDialect):
         else:
             return value
 
-    def _run_batches(self, connection, all_objects, query, query_fllow, dblink, params: Optional[dict[str, Any]]={}):
+    def _run_batches(self, connection, all_objects, query, query_fllow, dblink, params={}):
         batches = list(all_objects)
 
         while len(batches)>0:
@@ -2156,7 +2233,7 @@ class DMDialect(default.DefaultDialect):
             "OWNER = :param_0 "
             "AND DURATION IS NULL ")
 
-        if filter_names != None and type(filter_names) is list and len(filter_names) > 0:
+        if filter_names is not None and type(filter_names) is list and len(filter_names) > 0:
             params["param_1"] = self.denormalize_name(filter_names[0])
             sql_str += "AND TABLE_NAME IN(:param_1"
 
@@ -2188,7 +2265,7 @@ class DMDialect(default.DefaultDialect):
         else:
             return
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def _prepare_reflection_args(self, connection, table_name, schema=None,
                                  resolve_synonyms=False, dblink='', **kw):
         self.trace_process('DMDialect', '_prepare_reflection_args',
@@ -2216,7 +2293,7 @@ class DMDialect(default.DefaultDialect):
 
         return (actual_name, owner, dblink or '', synonym)
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_sequence_names(self, connection, schema=None, dblink=None, **kw):
         self.trace_process('DMDialect', 'get_sequence_names', connection, **kw)
 
@@ -2226,7 +2303,7 @@ class DMDialect(default.DefaultDialect):
         result = connection.execute(sql.text(s).bindparams(schema=schema))
         return [self.normalize_name(row[0]) for row in result]
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_schema_names(self, connection, **kw):
         self.trace_process('DMDialect', 'get_schema_names', connection, **kw)
         
@@ -2234,7 +2311,7 @@ class DMDialect(default.DefaultDialect):
         result = connection.execute(sql.text(s))
         return [self.normalize_name(row[0]) for row in result]
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_table_names(self, connection, schema=None, **kw):
         self.trace_process('DMDialect', 'get_table_names', connection, schema, **kw)
         
@@ -2257,7 +2334,7 @@ class DMDialect(default.DefaultDialect):
 
         return result
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_temp_table_names(self, connection, **kw):
         self.trace_process('DMDialect', 'get_temp_table_names', connection, **kw)
         
@@ -2279,7 +2356,7 @@ class DMDialect(default.DefaultDialect):
         cursor = connection.execute(sql.text(sql_str).bindparams(owner=schema))
         return [self.normalize_name(row[0]) for row in cursor]
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_view_names(self, connection, schema=None, **kw):
         self.trace_process('DMDialect', 'get_view_names', connection, schema, **kw)
         
@@ -2295,10 +2372,10 @@ class DMDialect(default.DefaultDialect):
             schema or self.default_schema_name
         )
 
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
 
-        if filter_names == None:
+        if filter_names is None:
             all_objects = self._get_all_objects(connection, schema, scope, kind, filter_names, dblink, **kw)
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
@@ -2342,7 +2419,7 @@ class DMDialect(default.DefaultDialect):
 
         return options.items()
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_table_options(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_table_options', connection, table_name, schema, **kw)
         
@@ -2382,7 +2459,7 @@ class DMDialect(default.DefaultDialect):
 
         return options
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_columns(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_columns', connection, table_name, schema, **kw)
 
@@ -2411,10 +2488,16 @@ class DMDialect(default.DefaultDialect):
                 "\n         ELSE a_tab_cols.data_type"\
                 "\n     END"\
                 "\n WHEN 'vector' THEN"\
-                "\n     CASE syscol.scale"\
-                "\n         WHEN 277 THEN 'VECTOR(' || syscol.LENGTH$ || ',FLOAT32)'"\
-                "\n         WHEN 533 THEN 'VECTOR(' || syscol.LENGTH$ || ',FLOAT64)'"\
-                "\n         WHEN 789 THEN 'VECTOR(' || syscol.LENGTH$ || ',INT8)'"\
+                "\n     CASE syscol.scale" \
+                "\n         WHEN 21 THEN 'VECTOR(' || syscol.LENGTH$ || ', *, DENSE)'" \
+                "\n         WHEN 277 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT32, DENSE)'"\
+                "\n         WHEN 533 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT64, DENSE)'"\
+                "\n         WHEN 789 THEN 'VECTOR(' || syscol.LENGTH$ || ', INT8, DENSE)'" \
+                "\n         WHEN 1045 THEN 'VECTOR(' || syscol.LENGTH$ || ', BINARY, DENSE)'" \
+                "\n         WHEN 4117 THEN 'VECTOR(' || syscol.LENGTH$ || ', *, SPARSE)'" \
+                "\n         WHEN 4373 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT32, SPARSE)'" \
+                "\n         WHEN 4629 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT64, SPARSE)'" \
+                "\n         WHEN 4885 THEN 'VECTOR(' || syscol.LENGTH$ || ', INT8, SPARSE)'" \
                 "\n         ELSE a_tab_cols.data_type"\
                 "\n     END"\
                 "\n ELSE a_tab_cols.data_type"\
@@ -2440,7 +2523,7 @@ class DMDialect(default.DefaultDialect):
                 (self.normalize_name(row[0]), row[0], row[1], row[2], row[3], row[4], row[5] == 'Y', row[6], row[7], row[8])
 
             if coltype in ('DEC', 'NUMERIC', 'DECIMAL', 'NUMBER'):
-                if precision == None:
+                if precision is None:
                     coltype = NUMBER
                 else:
                     coltype = NUMBER(precision, scale)
@@ -2449,11 +2532,17 @@ class DMDialect(default.DefaultDialect):
             elif coltype in ('INTEGER', 'INT'):
                 coltype = sqltypes.Integer
             elif 'WITH TIME ZONE' in coltype:
-                coltype = TIMESTAMP(timezone = True)
+                coltype = TIMESTAMP(timezone=True)
             elif 'VECTOR(' in coltype:
-                dim = int(coltype[7:coltype.find(',')])
-                format = coltype[coltype.find(',') + 1:len(coltype) - 1]
-                coltype = VECTOR(dim = dim, format = format)
+                parts = coltype.split(',', 2)
+                dim = int(parts[0][7:])
+                if dim == 0:
+                    dim = '*'
+                format = parts[1][1:]
+                storage_format = parts[2][1:-1]
+                coltype = VECTOR(dim=dim, format=format, storage_format=storage_format)
+            elif coltype == 'BYTE':
+                coltype = BYTE
             else:
                 coltype = re.sub(r'\(\d+\)', '', coltype)
                 try:
@@ -2464,7 +2553,7 @@ class DMDialect(default.DefaultDialect):
                     coltype = sqltypes.NULLTYPE
 
             if virtual_column == "YES":
-                computed = dict(sqltext = default)
+                computed = dict(sqltext=default)
                 default = None
             else:
                 computed = None
@@ -2503,9 +2592,9 @@ class DMDialect(default.DefaultDialect):
 
         params = {}
         params["param_0"] = owner
-        query = "select name as \"col_name\", id as \"tab_id\" from syscolumns where id IN (select id from sysobjects where name IN ("
+        query = 'select name as "col_name", id as "tab_id" from syscolumns where id IN (select id from sysobjects where name IN ('
         query_fllow = ") and SUBTYPE$ = 'UTAB' and schid = (select id from sysobjects where name = :param_0"
-        query_fllow += " and TYPE$ = 'SCH') and info3 & 0x3F not in(0x05 ,0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27)) and info2 = 1;"
+        query_fllow += " and TYPE$ = 'SCH') and info3 & 0x3F not in(0x05 ,0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27)) and info2 & 1 = 1;"
 
         result = self._run_batches(
             connection,
@@ -2524,7 +2613,7 @@ class DMDialect(default.DefaultDialect):
             tab_col_list[str(row_dict['tab_id'])] = row_dict['col_name']
         if len(table_id_list) == 0:
             return result_list
-        query = "SELECT id as \"id\", name as \"name\", info6 as \"info6\" FROM SYSOBJECTS WHERE ID IN ( "
+        query = 'SELECT id as "id", name as "name", info6 as "info6" FROM SYSOBJECTS WHERE ID IN ('
         query_fllow = ");"
         info6 = self._run_batches(
             connection,
@@ -2547,11 +2636,11 @@ class DMDialect(default.DefaultDialect):
 
     @_handle_synonyms_decorator
     def get_multi_columns(self, connection, schema, filter_names, scope, kind, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
         owner = self.denormalize_name(schema or self.default_schema_name)
 
-        if filter_names == None:
+        if filter_names is None:
             all_objects = self._get_all_objects(connection, schema, scope, kind, filter_names, dblink, **kw)
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
@@ -2559,34 +2648,51 @@ class DMDialect(default.DefaultDialect):
         params = {}
         params["param_0"] = owner
 
-        json_query = "SELECT sysobj.name as table_name, syscol.name as col_name,\n"\
-                    "CASE syscol.scale\n"\
-	                "   WHEN 0x4000 THEN 'JSONB'\n"\
-	                "   WHEN 0x2000 THEN 'JSON'\n"\
-                    "END data_type\n"\
-                    "FROM SYSOBJECTS sysobj, SYSCOLUMNS syscol\n"\
-                    "WHERE sysobj.name IN ("
-        json_query_fllow = ")AND sysobj.SUBTYPE$ = 'UTAB'\n"\
+        spec_type_query = "SELECT sysobj.name as table_name, syscol.name as col_name,\n"\
+                   "CASE LOWER(syscol.TYPE$)\n"\
+                   "    WHEN 'blob' THEN\n"\
+                   "        CASE syscol.scale\n" \
+                   "            WHEN 0x4000 THEN 'JSONB'\n"\
+                   "            WHEN 0x2000 THEN 'JSON'\n"\
+                   "            ELSE syscol.TYPE$\n"\
+                   "        END\n"\
+                   "    WHEN 'vector' THEN\n"\
+                   "        CASE syscol.scale\n"\
+                   "            WHEN 21 THEN 'VECTOR(' || syscol.LENGTH$ || ', \'*\', DENSE)'\n" \
+                   "            WHEN 277 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT32, DENSE)'\n"\
+                   "            WHEN 533 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT64, DENSE)'\n"\
+                   "            WHEN 789 THEN 'VECTOR(' || syscol.LENGTH$ || ', INT8, DENSE)'\n" \
+                   "            WHEN 1045 THEN 'VECTOR(' || syscol.LENGTH$ || ', BINARY, DENSE)'\n" \
+                   "            WHEN 4117 THEN 'VECTOR(' || syscol.LENGTH$ || ', \'*\', SPARSE)'\n" \
+                   "            WHEN 4373 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT32, SPARSE)'\n" \
+                   "            WHEN 4629 THEN 'VECTOR(' || syscol.LENGTH$ || ', FLOAT64, SPARSE)'\n" \
+                   "            WHEN 4885 THEN 'VECTOR(' || syscol.LENGTH$ || ', INT8, SPARSE)'\n" \
+                   "            ELSE syscol.TYPE$\n"\
+                   "        END\n"\
+                   "    ELSE syscol.TYPE$\n"\
+                   "END data_type\n"\
+                   "FROM SYSOBJECTS sysobj, SYSCOLUMNS syscol\n"\
+                   "WHERE sysobj.name IN ("
+        spec_type_query_fllow = ")AND sysobj.SUBTYPE$ = 'UTAB'\n"\
                             "AND sysobj.schid = (SELECT ID FROM SYSOBJECTS WHERE NAME = :param_0 AND TYPE$ = 'SCH')\n"\
-                            "AND syscol.id = sysobj.id\n"\
-                            "AND LOWER(syscol.type$) = 'blob'"\
-                            "AND syscol.scale IN (16384, 8192);"
+                            "AND syscol.id = sysobj.id"\
 
-        json_result = self._run_batches(
+        spec_result = self._run_batches(
             connection,
             all_objects,
-            json_query,
-            json_query_fllow,
+            spec_type_query,
+            spec_type_query_fllow,
             dblink,
             params
         )
 
-        json_list = []
-        for row_dict in json_result:
-            cdict = {"table_name" : self.normalize_name(row_dict["table_name"]),
-                     "colname" : self.normalize_name(row_dict["col_name"]),
-                     "data_type" : row_dict["data_type"]}
-            json_list.append(cdict)
+        spec_list = []
+        for row_dict in spec_result:
+            if row_dict['data_type'] in ('JSON', 'JSONB') or row_dict["data_type"].startswith("VECTOR("):
+                cdict = {"table_name": self.normalize_name(row_dict["table_name"]),
+                         "colname": self.normalize_name(row_dict["col_name"]),
+                         "data_type": row_dict["data_type"]}
+                spec_list.append(cdict)
 
         query = "SELECT a_tab_cols.table_name as \"table_name\", a_tab_cols.column_name as \"column_name\", a_tab_cols.data_type as \"data_type\",\n"\
                     "a_tab_cols.char_length as \"char_length\", a_tab_cols.data_precision as \"data_precision\", a_tab_cols.data_scale as \"data_scale\",\n"\
@@ -2622,14 +2728,14 @@ class DMDialect(default.DefaultDialect):
             length = row_dict['char_length']
             precision = self.maybe_int(row_dict["data_precision"])
 
-            if coltype == 'BLOB' and len(json_list) > 0:
-                for dict in json_list:
+            if coltype in ['BLOB', 'VECTOR'] and len(spec_list) > 0:
+                for dict in spec_list:
                     if dict["table_name"] == table_name and dict["colname"] == colname:
                         coltype = dict["data_type"]
-                        json_list.remove(dict)
+                        spec_list.remove(dict)
 
             if coltype in ('DEC', 'NUMERIC', 'DECIMAL', 'NUMBER'):
-                if precision == None:
+                if precision is None:
                     coltype = NUMBER
                 else:
                     coltype = NUMBER(precision, scale)
@@ -2639,6 +2745,16 @@ class DMDialect(default.DefaultDialect):
                 coltype = sqltypes.Integer
             elif 'WITH TIME ZONE' in coltype:
                 coltype = TIMESTAMP(timezone = True)
+            elif coltype.startswith("VECTOR("):
+                parts = coltype.split(',', 2)
+                dim = int(parts[0][7:])
+                if dim == 0:
+                    dim = '*'
+                format = parts[1][1:]
+                storage_format = parts[2][1:-1]
+                coltype = VECTOR(dim=dim, format=format, storage_format=storage_format)
+            elif coltype == 'BYTE':
+                coltype = BYTE
             else:
                 coltype = re.sub(r'\(\d+\)', '', coltype)
                 try:
@@ -2650,7 +2766,7 @@ class DMDialect(default.DefaultDialect):
 
             default = row_dict["data_default"]
             if row_dict["virtual_column"] == "YES":
-                computed = dict(sqltext = default)
+                computed = dict(sqltext=default)
                 default = None
             else:
                 computed = None
@@ -2682,10 +2798,10 @@ class DMDialect(default.DefaultDialect):
 
     @_handle_synonyms_decorator
     def get_multi_table_comment(self, connection, schema, filter_names, scope, kind, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
 
-        if filter_names == None:
+        if filter_names is None:
             all_objects = self._get_all_objects(connection, schema, scope, kind, filter_names, dblink, **kw)
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
@@ -2732,7 +2848,7 @@ class DMDialect(default.DefaultDialect):
         )
         return a
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_table_comment(
         self,
         connection,
@@ -2776,12 +2892,11 @@ class DMDialect(default.DefaultDialect):
                 f"{schema}.{table_name}" if schema else table_name
             ) from None
 
-
         return {"text": comment_str}
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def _get_indexes_rows(self, connection, schema, filter_names, scope, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
 
         schema = self.denormalize_name(schema or self.default_schema_name)
@@ -2796,12 +2911,12 @@ class DMDialect(default.DefaultDialect):
                     "FROM ALL_IND_COLUMNS WHERE TABLE_OWNER = :param_0 AND TABLE_NAME IN (")
         query_fllow = ") ORDER BY index_name"
 
-        if filter_names == None:
+        if filter_names is None:
             all_objects = self._get_all_objects(connection, schema, scope, None, filter_names, dblink, **kw)
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
 
-        if dblink != None:
+        if dblink is not None:
             query = query % {'dblink': dblink}
         else:
             query = query % {'dblink': ''}
@@ -2816,13 +2931,13 @@ class DMDialect(default.DefaultDialect):
         )
 
         query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", index_type as \"index_type\", "
-                "uniqueness as \"uniqueness\",  compression as \"compression\", prefix_length as \"prefix_length\", '' as \"column_name\"\n")
+                "uniqueness as \"uniqueness\",  compression as \"compression\", prefix_length as \"prefix_length\"\n")
         if flag:
             query += "FROM USER_INDEXES WHERE TABLE_OWNER = :param_0 AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME IN ("
         else:
             query += "FROM ALL_INDEXES WHERE TABLE_OWNER = :param_0 AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME IN ("
 
-        if dblink != None:
+        if dblink is not None:
             query = query % {'dblink': dblink}
         else:
             query = query % {'dblink': ''}
@@ -2836,18 +2951,31 @@ class DMDialect(default.DefaultDialect):
             params
         )
 
-        for col_dict in col_result:
-            for ind_dict in index_result:
-                if (col_dict["table_name"] == ind_dict["table_name"] and col_dict["index_name"] == ind_dict[
-                    "index_name"] and col_dict["table_owner"] == ind_dict["table_owner"]):
-                    col_dict._key_to_index["index_type"] = 4
-                    col_dict._data = col_dict._data + (ind_dict._data[3],)
-                    col_dict._key_to_index["uniqueness"] = 5
-                    col_dict._data = col_dict._data + (ind_dict._data[4],)
-                    col_dict._key_to_index["compression"] = 6
-                    col_dict._data = col_dict._data + (ind_dict._data[5],)
-                    col_dict._key_to_index["prefix_length"] = 7
-                    col_dict._data = col_dict._data + (ind_dict._data[6],)
+        col_dict = []
+        for row in col_result:
+            temp_dict = {}
+            temp_dict["table_name"] = row["table_name"]
+            temp_dict["index_name"] = row["index_name"]
+            temp_dict["table_owner"] = row["table_owner"]
+            temp_dict["column_name"] = row["column_name"]
+            col_dict.append(temp_dict)
+        ind_dict = []
+        for row in index_result:
+            temp_dict = {}
+            temp_dict["table_name"] = row["table_name"]
+            temp_dict["index_name"] = row["index_name"]
+            temp_dict["table_owner"] = row["table_owner"]
+            temp_dict["index_type"] = row["index_type"]
+            temp_dict["uniqueness"] = row["uniqueness"]
+            temp_dict["compression"] = row["compression"]
+            temp_dict["prefix_length"] = row["prefix_length"]
+            ind_dict.append(temp_dict)
+        for ind_row in ind_dict:
+            for col_row in col_dict:
+                if (col_row["table_name"] == ind_row["table_name"] and col_row["index_name"] == ind_row["index_name"]
+                        and col_row["table_owner"] == ind_row["table_owner"]):
+                    ind_row.update(col_row)
+                    del col_row
 
         pks = {
             row_dict["cons_name"]
@@ -2857,7 +2985,7 @@ class DMDialect(default.DefaultDialect):
 
         return [
             row_dict
-            for row_dict in col_result
+            for row_dict in ind_dict
             if row_dict["index_name"] not in pks
         ]
 
@@ -2873,7 +3001,7 @@ class DMDialect(default.DefaultDialect):
         dblink=None,
         **kw,
     ):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
         all_objects = self._get_all_objects(
             connection, schema, scope, kind, filter_names, dblink, **kw
@@ -2918,7 +3046,7 @@ class DMDialect(default.DefaultDialect):
             )
         )
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_indexes(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_indexes', 
                            connection, table_name, schema, **kw)
@@ -2928,29 +3056,33 @@ class DMDialect(default.DefaultDialect):
         self.get_whether_exists_table(connection, table_name, schema)
 
         params = {'table_name': table_name, 'schema': schema}
-        if schema !=None and schema.upper() ==self.default_schema_name.upper():
+        if schema is not None and schema.upper() == self.default_schema_name.upper():
             flag = True
         else:
-            flag =False
+            flag = False
 
-        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", column_name as \"column_name\" "
-                    "FROM ALL_IND_COLUMNS%(dblink)s WHERE TABLE_OWNER = :schema AND TABLE_NAME = :table_name ORDER BY index_name")
+        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\","
+                 " column_name as \"column_name\" FROM ALL_IND_COLUMNS%(dblink)s WHERE TABLE_OWNER = :schema AND"
+                 " TABLE_NAME = :table_name ORDER BY index_name")
 
-        if dblink != None:
+        if dblink is not None:
             query = query % {'dblink': dblink}
         else:
             query = query % {'dblink': ''}
 
         col_result = connection.execute(sql.text(query), parameters=params)
 
-        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\", index_type as \"index_type\",\n"
-                "uniqueness as \"uniqueness\", compression as \"compression\", prefix_length as \"prefix_length\"\n")
+        query = ("SELECT table_name as \"table_name\", index_name as \"index_name\", table_owner as \"table_owner\","
+                 " index_type as \"index_type\", uniqueness as \"uniqueness\", compression as \"compression\","
+                 " prefix_length as \"prefix_length\"\n")
         if flag:
-            query += "FROM USER_INDEXES WHERE TABLE_OWNER = :schema AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME = :table_name ORDER BY index_name"
+            query += ("FROM USER_INDEXES WHERE TABLE_OWNER = :schema AND index_type != 'VIRTUAL' AND"
+                      " GENERATED = 'N' AND TABLE_NAME = :table_name ORDER BY index_name")
         else:
-            query += "FROM ALL_INDEXES WHERE TABLE_OWNER = :schema AND index_type != 'VIRTUAL' AND GENERATED = 'N' AND TABLE_NAME = :table_name ORDER BY index_name"
+            query += ("FROM ALL_INDEXES WHERE TABLE_OWNER = :schema AND index_type != 'VIRTUAL' AND"
+                      " GENERATED = 'N' AND TABLE_NAME = :table_name ORDER BY index_name")
 
-        if dblink != None:
+        if dblink is not None:
             query = query % {'dblink': dblink}
         else:
             query = query % {'dblink': ''}
@@ -2981,15 +3113,16 @@ class DMDialect(default.DefaultDialect):
                 index['dialect_options']['dm_compress'] = ind_dict.prefix_length
 
             for col_dict in column_dict:
-                if col_dict.table_owner == ind_dict.table_owner and col_dict.table_name == ind_dict.table_name and col_dict.index_name == ind_dict.index_name:
+                if (col_dict.table_owner == ind_dict.table_owner and col_dict.table_name == ind_dict.table_name and
+                        col_dict.index_name == ind_dict.index_name):
                     index['column_names'].append(self.normalize_name(col_dict.column_name))
                     del col_dict
 
         return indexes
 
-    @cache_with_list_decorator
+    @dynamic_cache(cache_with_list_decorator, "_enable_cache")
     def get_multi_constraint_data(self, connection, schema, filter_names, scope, kind, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
         schema = self.denormalize_name(schema or self.default_schema_name)
         query = "SELECT" \
@@ -3007,14 +3140,14 @@ class DMDialect(default.DefaultDialect):
         params = {}
         params["param_0"] = schema
         if schema == self.denormalize_name(self.default_schema_name):
-            query += "\nFROM user_constraints%(dblink)s ac," + "\nuser_cons_columns%(dblink)s loc," + "\nuser_cons_columns%(dblink)s rem"\
-                     "\nWHERE "
+            query += ("\nFROM user_constraints%(dblink)s ac," + "\nuser_cons_columns%(dblink)s loc," +
+                      "\nuser_cons_columns%(dblink)s rem WHERE ")
         else:
-            query += "\nFROM all_constraints%(dblink)s ac," + "\nall_cons_columns%(dblink)s loc," + "\nall_cons_columns%(dblink)s rem"\
-                     "\nWHERE ac.owner = :param_0 \nAND "
+            query += ("\nFROM all_constraints%(dblink)s ac," + "\nall_cons_columns%(dblink)s loc," +
+                      "\nall_cons_columns%(dblink)s rem WHERE ac.owner = :param_0 \nAND ")
 
         query += "ac.table_name IN("
-        if dblink != None:
+        if dblink is not None:
             query = query % {'dblink': dblink}
         else:
             query = query % {'dblink': ''}
@@ -3027,7 +3160,7 @@ class DMDialect(default.DefaultDialect):
             "\nAND (rem.position IS NULL or loc.position=rem.position)" \
             "\nORDER BY ac.constraint_name, loc.position"
 
-        if filter_names == None:
+        if filter_names is None:
             all_objects = self._get_all_objects(connection, schema, scope, kind, filter_names, dblink, **kw)
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
@@ -3042,7 +3175,7 @@ class DMDialect(default.DefaultDialect):
         ))
         return result
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def _get_constraint_data(self, connection, table_name, schema=None,
                              dblink='', **kw):
         self.trace_process('DMDialect', '_get_constraint_data', connection, table_name, schema, dblink, **kw)
@@ -3062,11 +3195,11 @@ class DMDialect(default.DefaultDialect):
         schema = self.denormalize_name(schema or self.default_schema_name)
 
         if schema == self.denormalize_name(self.default_schema_name):
-            text += "\nFROM user_constraints%(dblink)s ac," + "\nuser_cons_columns%(dblink)s loc," + "\nuser_cons_columns%(dblink)s rem"\
-                    "\nWHERE "
+            text += ("\nFROM user_constraints%(dblink)s ac," + "\nuser_cons_columns%(dblink)s loc," +
+                     "\nuser_cons_columns%(dblink)s rem WHERE ")
         else:
-            text += "\nFROM all_constraints%(dblink)s ac," + "\nall_cons_columns%(dblink)s loc," + "\nall_cons_columns%(dblink)s rem"\
-                    "\nWHERE ac.owner = :schema \nAND "
+            text += ("\nFROM all_constraints%(dblink)s ac," + "\nall_cons_columns%(dblink)s loc," +
+                     "\nall_cons_columns%(dblink)s rem WHERE ac.owner = :schema \nAND ")
 
         text += "ac.table_name = :table_name"\
                 "\nAND ac.constraint_type IN ('R','P','U')"
@@ -3089,7 +3222,7 @@ class DMDialect(default.DefaultDialect):
     
     @_handle_synonyms_decorator
     def get_multi_pk_constraint(self, connection, schema, filter_names, scope, kind, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
         dblink = kw.get('dblink', '')
 
@@ -3122,7 +3255,7 @@ class DMDialect(default.DefaultDialect):
             )
         )
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_pk_constraint(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_pk_constraint', connection, table_name, schema, **kw)
         
@@ -3153,7 +3286,7 @@ class DMDialect(default.DefaultDialect):
     
     @_handle_synonyms_decorator
     def get_multi_foreign_keys(self, connection, *, schema, filter_names, scope, kind, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
         dblink = kw.get('dblink', '')
 
@@ -3217,13 +3350,10 @@ class DMDialect(default.DefaultDialect):
 
         return (
             (key, list(fkeys[key].values()) if key in fkeys else default())
-            for key in (
-            (schema, self.normalize_name(obj_name))
-            for obj_name in all_objects
-        )
+            for key in ((schema, self.normalize_name(obj_name)) for obj_name in all_objects)
         )
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_foreign_keys(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_foreign_keys', connection, table_name, schema, **kw)
         
@@ -3304,7 +3434,7 @@ class DMDialect(default.DefaultDialect):
 
     @_handle_synonyms_decorator
     def get_multi_unique_constraints(self, connection, *, schema, filter_names, scope, kind, dblink=None, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
 
         all_objects = self._get_all_objects(connection, schema, scope, kind, filter_names, dblink, **kw)
@@ -3351,13 +3481,10 @@ class DMDialect(default.DefaultDialect):
                 if key in unique_cons
                 else default(),
             )
-            for key in (
-            (schema, self.normalize_name(obj_name))
-            for obj_name in all_objects
-        )
+            for key in ((schema, self.normalize_name(obj_name)) for obj_name in all_objects)
         )
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_unique_constraints(self, connection, table_name, schema=None, **kw):
         self.trace_process('DMDialect', 'get_unique_constraints',
                            connection, table_name, schema, **kw)
@@ -3399,7 +3526,7 @@ class DMDialect(default.DefaultDialect):
 
         return ucons
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_materialized_view_names(
         self, connection, schema=None, dblink=None, _normalize=True, **kw
     ):
@@ -3414,7 +3541,7 @@ class DMDialect(default.DefaultDialect):
         else:
             return [row[0] for row in mat_view_names]
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_view_definition(
         self,
         connection,
@@ -3468,10 +3595,10 @@ class DMDialect(default.DefaultDialect):
 
     @_handle_synonyms_decorator
     def get_multi_check_constraints(self, connection, *, schema, filter_names, dblink=None, scope, kind, include_all=False, **kw):
-        if type(filter_names) == str:
+        if type(filter_names) is str:
             filter_names = [filter_names]
 
-        if filter_names == None:
+        if filter_names is None:
             all_objects = self._get_all_objects(connection, schema, scope, kind, filter_names, dblink, **kw)
         else:
             all_objects = [self.denormalize_name(n) for n in filter_names]
@@ -3517,7 +3644,7 @@ class DMDialect(default.DefaultDialect):
         result = check_constraints.items()
         return result
 
-    @reflection.cache
+    @dynamic_cache(reflection.cache, "_enable_cache")
     def get_check_constraints(
         self, connection, table_name, schema=None, include_all=False, **kw
     ):

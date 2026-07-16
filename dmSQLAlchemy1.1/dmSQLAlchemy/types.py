@@ -87,7 +87,7 @@ class INTERVAL(sqltypes.TypeEngine):
                  minute_precision=None,
                  second_precision=None,
                  native = True):
-        super(Interval, self).__init__()
+        super(INTERVAL, self).__init__()
         self.native = native
         self.year_precision = year_precision
         self.to_month = to_month
@@ -160,8 +160,7 @@ class _LOBMixin(object):
 class _NativeUnicodeMixin(object):
     if util.py2k:
         def bind_processor(self, dialect):
-                return super(
-                    _NativeUnicodeMixin, self).bind_processor(dialect)
+            return super(_NativeUnicodeMixin, self).bind_processor(dialect)
 
 
 class _DMChar(_NativeUnicodeMixin, sqltypes.CHAR):
@@ -445,10 +444,9 @@ colspecs = {
     sqltypes.Time: TIME,
     sqltypes.BLOB: _DMBLOB,
     sqltypes.BINARY: _DMBinary,
-    sqltypes.JSON.JSONIndexType:JSONIndexType,
-    sqltypes.JSON.JSONPathType:JSONPathType,
-    sqltypes.JSON:JSON
-
+    sqltypes.JSON.JSONIndexType: JSONIndexType,
+    sqltypes.JSON.JSONPathType: JSONPathType,
+    sqltypes.JSON: JSON
 }
 
 ischema_names = {

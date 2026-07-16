@@ -6,7 +6,7 @@ from setuptools import find_packages, setup
 
 setup_params = dict(
     name="dmSQLAlchemy",
-    version='1.4.47',
+    version='1.4.48',
     description="SQLAlchemy dialect for DM",
     author="Dameng",
     author_email="",

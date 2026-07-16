@@ -30,11 +30,14 @@ from .types import \
     FLOAT, DOUBLE_PRECISION, LONGVARCHAR, INTERVAL,\
     VARCHAR2, NVARCHAR2, ROWID, VECTOR, VectorAdaptor
 from .vector import VectorWordSeek, VectorImageSeek
+from .vec_client import dmVecClient, FtsIndexParam, FtsParser
+from .vec_client import FieldSchema, DataType, VecIndexType, CollectionSchema
 
 __all__ = (
     'VARCHAR', 'NVARCHAR', 'CHAR', 'DATE', 'DATETIME', 'NUMBER',
     'BLOB', 'BFILE', 'CLOB', 'NCLOB', 'TIMESTAMP', 'JSON',
     'FLOAT', 'DOUBLE_PRECISION', 'dialect', 'INTERVAL',
     'VARCHAR2', 'NVARCHAR2', 'ROWID', 'VECTOR', 'VectorAdaptor',
-    'VectorWordSeek', 'VectorImageSeek'
+    'VectorWordSeek', 'VectorImageSeek', 'dmVecClient', 'FieldSchema',
+    'DataType', 'VecIndexType', 'CollectionSchema', 'FtsIndexParam', 'FtsParser'
 )
