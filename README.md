@@ -1,3 +1,7 @@
+> ⚠️ **Fork 说明**：本仓库 Fork 自 [dmdb/dmPython](https://github.com/dmdb/dmPython)，  
+> 仅用于提交 PR 修复/优化，不作为独立维护版本。  
+> 请以官方仓库为准。
+
 # dmSQLAlchemy
 
 该仓库主要提供了支持通过SQLAlchemy连接达梦数据库的方言包
