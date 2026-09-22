@@ -1,4 +1,4 @@
-> ⚠️ **Fork 说明**：本仓库 Fork 自 [dmdb/dmPython](https://github.com/dmdb/dmPython)，  
+> ⚠️ **Fork 说明**：本仓库 Fork 自 [DamengDB/dmSQLAlchemy](https://github.com/DamengDB/dmSQLAlchemy)，  
 > 仅用于提交 PR 修复/优化，不作为独立维护版本。  
 > 请以官方仓库为准。
 
