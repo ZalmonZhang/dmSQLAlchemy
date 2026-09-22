@@ -118,6 +118,14 @@ class DMDialect_Adapter:
 
     def do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
 
+        # text() 等非 Core INSERT 的 executemany 没有 .table，无法拼 RETURNING，
+        # 直接走普通 executemany，避免 AttributeError: 'TextClause' object has no attribute 'table'。
+        has_out = context is not None and getattr(context, "out_parameters", None) is not None \
+            and len(context.out_parameters) > 0
+        if not has_out and not hasattr(getattr(context, "invoked_statement", None), "table"):
+            cursor.executemany(statement, parameters)
+            return
+
         if context.out_parameters != None and len(context.out_parameters) > 0:
             dict_len = len(context.out_parameters)
             poslist = []
@@ -164,6 +172,13 @@ class DMDialect_Adapter:
                     context.inserted_primary_key_rows.append(tuple(result[columns + i]))
 
     def async_do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
+
+        # 同 do_executemany_return：text() 批量无 .table，走普通 executemany。
+        has_out = context is not None and getattr(context, "out_parameters", None) is not None \
+            and len(context.out_parameters) > 0
+        if not has_out and not hasattr(getattr(context, "invoked_statement", None), "table"):
+            await_only(cursor.executemany(statement, parameters))
+            return
 
         if context.out_parameters != None and len(context.out_parameters) > 0:
             dict_len = len(context.out_parameters)
@@ -262,10 +277,18 @@ class DMTSQLDialect_Adapter(DMDialect_Adapter):
 class NoCompatible_Mode:
 
     def json_proc_decorator(self, func):
+        # 原生 JSON 列读回的是字符串，需要在此反序列化；否则 ORM 拿到的是 str 而非 dict。
         def process(value):
+            if value is None:
+                return None
             if type(value) is dict or type(value) is list:
-                return str(value)
-            return value
+                return value
+            if isinstance(value, (bytes, bytearray)):
+                value = value.decode("utf-8", "replace")
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
 
         return process
 

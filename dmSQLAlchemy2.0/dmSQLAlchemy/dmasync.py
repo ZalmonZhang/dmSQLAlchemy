@@ -955,13 +955,19 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
         **kwargs,
     ):
         self.async_connect = None
+        # 父类 DMDialect_dmPython.__init__ 的第 3/4 个位置参数是
+        # autocommit / connection_timeout：原实现按位置传 arraysize / encoding_errors，
+        # 会导致 arraysize 被静默吞掉（恒为父类默认 50）、encoding_errors 污染
+        # connection_timeout（随后被塞进 dmPython.connect）。此处改为关键字传参；
+        # encoding_errors / thick_mode 在父类无对应参数，改为挂在本实例上，不透传。
         super().__init__(
-            auto_convert_lobs,
-            coerce_to_decimal,
-            arraysize,
-            encoding_errors,
+            auto_convert_lobs=auto_convert_lobs,
+            coerce_to_decimal=coerce_to_decimal,
+            arraysize=50 if arraysize is None else arraysize,
             **kwargs,
         )
+        self.encoding_errors = encoding_errors
+        self.thick_mode = thick_mode
 
         self.async_connect = self.async_connect
 
@@ -1279,7 +1285,8 @@ class DMDialect_dmAsync(_dmPython.DMDialect_dmPython):
 
 class AsyncAdapt_dmasync_cursor(AsyncAdapt_dbapi_cursor):
 
-    _cursor = None
+    # 注意：不可在此声明 `_cursor = None`。SQLAlchemy 基类以 __slots__ 定义 _cursor，
+    # 子类同名类属性会遮蔽 slot 描述符，导致赋值报 read-only。
     __slots__ = ()
 
     @property
@@ -1358,7 +1365,7 @@ class AsyncAdapt_dmasync_ss_cursor(
             self._cursor = None  # type: ignore
 
 class AsyncAdapt_dmasync_connection(AsyncAdapt_dbapi_connection):
-    _connection = None
+    # 注意：不可在此声明 `_connection = None`，原因同 AsyncAdapt_dmasync_cursor。
     __slots__ = ()
 
     thin = True
