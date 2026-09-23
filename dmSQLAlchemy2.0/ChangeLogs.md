@@ -6,6 +6,22 @@
 
 ## ChangeLogs
 
+#### 未发布（2026-09-23）
+
+* 修复了异步方言 `DMDialect_dmAsync` 初始化参数错位的问题：`arraysize` 此前被静默吞掉
+  （恒为 50）、`encoding_errors` 会污染 `connection_timeout` 并被传入 `dmPython.connect`，
+  且 `connection_timeout` / `autocommit` 作为方言参数会报 `TypeError`；现改为关键字传参
+* 修复了异步建连接时报 `attribute ... is read-only` 的问题：删除了
+  `AsyncAdapt_dmasync_cursor` / `AsyncAdapt_dmasync_connection` 中对 SQLAlchemy 基类
+  `__slots__` 的遮蔽声明
+* 修复了 `text()` 语句配合 `executemany` 批量执行时报
+  `'TextClause' object has no attribute 'table'` 的问题（同步、异步方言均受影响）
+* 修复了原生 `JSON` 类型列读回为字符串而非字典的问题
+* 修复了 ORM 单次提交插入多行（如 `session.add_all([...])`）报错的问题：方言此前声明支持
+  "批量 + `RETURNING`"，但达梦驱动实际不支持（数组 out 变量与结果集式 `RETURNING` 均不可用），
+  现不再声明该能力，由 SQLAlchemy 自动改用逐行插入，主键正确回填；同步的 `FlushError` 与
+  异步的 `TypeError` 一并消除，且 `return_defaults()` + `executemany` 不再静默返回错误主键
+
 #### dmSQLAlchemy v2.0.17(2026-4-21)
 
 * 新增了执行语句时对于多行同时插入时允许多行返回的功能
