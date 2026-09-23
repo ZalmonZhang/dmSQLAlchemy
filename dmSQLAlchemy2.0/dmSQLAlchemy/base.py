@@ -1803,8 +1803,14 @@ class DMDialect(default.DefaultDialect):
     update_returning = True
     delete_returning = True
     insert_returning = True
-    insert_executemany_returning = True
-    insert_executemany_returning_sort_by_parameter_order = True
+    # 达梦驱动实测不支持任何形式的"批量 + RETURNING"：数组 out var 报
+    # `array size exceeded`、结果集式 RETURNING 报 -2007 语法错，只有单行
+    # `RETURNING ... INTO :scalar` 可用。原实现硬声明 True，导致 ORM 多行 flush
+    # 走 executemany+RETURNING 却只回 1 行 PK（同步 FlushError / 异步 TypeError），
+    # 且 return_defaults / 显式 returning + executemany 会静默返回错误 PK。
+    # 置 False 后 SQLAlchemy 自动退化为逐行 INSERT + 单行 RETURNING，正确性优先。
+    insert_executemany_returning = False
+    insert_executemany_returning_sort_by_parameter_order = False
     supports_trace = False
     supports_trace_params = False
     outfile = None

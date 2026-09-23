@@ -173,7 +173,8 @@ class DMDialect_dmPython(DMDialect):
     supports_statement_cache = True
     execution_ctx_cls = DMExecutionContext_dmPython
     statement_compiler = DMCompiler_dmPython
-    insert_executemany_returning = True
+    # 同 base.DMDialect：达梦驱动不具备 executemany+RETURNING 能力，禁止谎报。
+    insert_executemany_returning = False
     
     supports_sane_rowcount = True
     supports_sane_multi_rowcount = False

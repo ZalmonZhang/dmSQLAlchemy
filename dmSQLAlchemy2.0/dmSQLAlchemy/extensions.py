@@ -117,107 +117,53 @@ class DMDialect_Adapter:
     escape_to_quote = '""'
 
     def do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
-
-        # text() 等非 Core INSERT 的 executemany 没有 .table，无法拼 RETURNING，
-        # 直接走普通 executemany，避免 AttributeError: 'TextClause' object has no attribute 'table'。
+        # 达梦驱动不支持任何形式的"批量 + RETURNING"：数组 out var 报
+        # `array size exceeded`、结果集式 RETURNING 报 -2007 语法错。因此除非确实
+        # 带了 out 参数，executemany 一律走普通批量，不再手工拼 `RETURNING ... INTO ?`
+        #（旧实现会静默只回 1 行错误 PK）。
         has_out = context is not None and getattr(context, "out_parameters", None) is not None \
             and len(context.out_parameters) > 0
-        if not has_out and not hasattr(getattr(context, "invoked_statement", None), "table"):
+        if not has_out:
             cursor.executemany(statement, parameters)
             return
 
-        if context.out_parameters != None and len(context.out_parameters) > 0:
-            dict_len = len(context.out_parameters)
-            poslist = []
-            for k in range(dict_len):
-                for j in range(columns):
-                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
-                        poslist.append(j)
-                        break
-            poslist, parameters = dialect.check_position(poslist, parameters)
-            result = cursor.executemany(statement, parameters)
-            for k in range(dict_len):
-                if result[poslist[k]] == [None]:
-                    context.out_parameters['ret_' + str(k)] = []
-                else:
-                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
-        else:
-            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table, "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
-            table_name = dialect.identifier_preparer.format_table(table_class)
-            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
-                primary_key_list = table_class.primary_key.c._all_columns
-                dict_len = len(primary_key_list)
-                statement = statement + ' RETURNING ' + table_name + '.' + dialect.do_normalize_name(
-                    dialect.identifier_preparer.format_column(primary_key_list[0]))
+        dict_len = len(context.out_parameters)
+        poslist = []
+        for k in range(dict_len):
+            for j in range(columns):
+                if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
+                    poslist.append(j)
+                    break
+        poslist, parameters = dialect.check_position(poslist, parameters)
+        result = cursor.executemany(statement, parameters)
+        for k in range(dict_len):
+            if result[poslist[k]] == [None]:
+                context.out_parameters['ret_' + str(k)] = []
             else:
-                statement = statement + ' RETURNING ' + table_name + '.ROWID'
-                dict_len = 1
-            for i in range(dict_len - 1):
-                statement = statement + ',' + table_name + '.' + dialect.do_normalize_name(dialect.identifier_preparer.format_column(primary_key_list[i + 1]))
-            statement = statement + ' INTO ?'
-            for i in range(dict_len - 1):
-                statement = statement + ', ?'
-            for i in range(rows):
-                for j in range(dict_len):
-                    parameters[i].append(None)
-            result = cursor.executemany(statement, parameters)
-            context.invoked_statement.table._update_true_table = None
-            context.inserted_primary_key_rows = []
-            if dict_len == 1:
-                temp_list = result[columns]
-                for j in range(len(temp_list)):
-                    context.inserted_primary_key_rows.append((temp_list[j],))
-            else:
-                for i in range(dict_len):
-                    context.inserted_primary_key_rows.append(tuple(result[columns + i]))
+                context.out_parameters['ret_' + str(k)] = result[poslist[k]]
 
     def async_do_executemany_return(self, columns, rows, dialect, cursor, statement, parameters, context=None):
-
-        # 同 do_executemany_return：text() 批量无 .table，走普通 executemany。
+        # 同 do_executemany_return：无 out 参数时一律普通批量。
         has_out = context is not None and getattr(context, "out_parameters", None) is not None \
             and len(context.out_parameters) > 0
-        if not has_out and not hasattr(getattr(context, "invoked_statement", None), "table"):
+        if not has_out:
             await_only(cursor.executemany(statement, parameters))
             return
 
-        if context.out_parameters != None and len(context.out_parameters) > 0:
-            dict_len = len(context.out_parameters)
-            poslist = []
-            for k in range(dict_len):
-                for j in range(columns):
-                    if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
-                        poslist.append(j)
-                        break
-            poslist, parameters = dialect.check_position(poslist, parameters)
-            result = await_only(cursor.executemany(statement, parameters))
-            for k in range(dict_len):
-                if result[poslist[k]] == [None]:
-                    context.out_parameters['ret_' + str(k)] = []
-                else:
-                    context.out_parameters['ret_' + str(k)] = result[poslist[k]]
-        else:
-            table_class = context.invoked_statement.table._update_true_table if hasattr(context.invoked_statement.table,
-                                                                                        "_update_true_table") and context.invoked_statement.table._update_true_table != None else context.invoked_statement.table
-            table_name = dialect.identifier_preparer.format_table(table_class)
-            if hasattr(table_class.primary_key, "c") and len(table_class.primary_key.c._all_columns) > 0:
-                primary_key_list = table_class.primary_key.c._all_columns
-                dict_len = len(primary_key_list)
-                statement = statement + ' RETURNING ' + table_name + '.' + dialect.do_normalize_name(
-                    dialect.identifier_preparer.format_column(primary_key_list[0]))
+        dict_len = len(context.out_parameters)
+        poslist = []
+        for k in range(dict_len):
+            for j in range(columns):
+                if parameters[0][j] == context.out_parameters['ret_' + str(k)]:
+                    poslist.append(j)
+                    break
+        poslist, parameters = dialect.check_position(poslist, parameters)
+        result = await_only(cursor.executemany(statement, parameters))
+        for k in range(dict_len):
+            if result[poslist[k]] == [None]:
+                context.out_parameters['ret_' + str(k)] = []
             else:
-                statement = statement + ' RETURNING ' + table_name + '.ROWID'
-                dict_len = 1
-            for i in range(dict_len - 1):
-                statement = statement + ',' + table_name + '.' + dialect.do_normalize_name(
-                    dialect.identifier_preparer.format_column(primary_key_list[i + 1]))
-            statement = statement + ' INTO ?'
-            for i in range(dict_len - 1):
-                statement = statement + ', ?'
-            for i in range(rows):
-                for j in range(dict_len):
-                    parameters[i].append(None)
-            await_only(cursor.executemany(statement, parameters))
-            context.invoked_statement.table._update_true_table = None
+                context.out_parameters['ret_' + str(k)] = result[poslist[k]]
 
     def limit_offset_clause(self, dialect, select, fetch_clause, fetch_clause_options, **kw):
 
