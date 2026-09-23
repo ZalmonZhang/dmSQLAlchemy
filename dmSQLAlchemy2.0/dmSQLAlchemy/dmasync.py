@@ -74,7 +74,8 @@ class Connection:
 
     async def _connect(self, cargs):
         import dmAsync
-        cargs['connection_timeout'] = cargs['connection_timeout'] if cargs['connection_timeout'] else 0
+        # 不能硬取 cargs['connection_timeout']：dsn-only 等路径没有该键，会 KeyError。
+        cargs['connection_timeout'] = cargs.get('connection_timeout') or 0
         # 如果连接串中存在schema，则采用连接串中的schema，SQLAlchemy中为database，忽略后来设置的schema=''，否则采用schema=''，均无则采取默认
         if 'database' in cargs:
             schema = cargs['database']
@@ -99,6 +100,9 @@ class AsyncConnection(dmPython.Connection):
         params,
         kwargs,
     ):
+        # 保留 dsn：create_connect_args 生成的伪 dsn 平时被 host/port 取代，
+        # 但调用方只给 dsn（无 host）时需要回退使用，不能静默丢弃。
+        self._dsn = dsn
         self._connect_coroutine = self._connect(params, kwargs)
 
     def __await__(self):
@@ -119,13 +123,20 @@ class AsyncConnection(dmPython.Connection):
             self._impl = None
 
     async def _connect(self, params, kwargs):
-        if params is None:
-            conn = Connection(*kwargs)
-            await conn._connect(kwargs)
-        else:
-            conn = Connection(*params, **kwargs)
-            await conn._connect(*params, **kwargs)
-        self._impl=conn.conn
+        # SQLAlchemy 走 params=None 路径；params 分支依赖 ConnectParams 实例化，
+        # 实为死代码，原 Connection(*params, **kwargs) 亦不正确，故不再展开。
+        # 原 Connection(*kwargs) 会把 dict 的 key 当位置参数传入（≥19 个 kwargs 即
+        # TypeError），而 Connection._connect(cargs) 只使用 cargs 字典，故改为无参构造。
+        cargs = dict(kwargs)
+        cargs.pop('dsn', None)
+        # dmAsync 规定 dsn 与 host 互斥（同时传会 ValueError）；create_connect_args 会同时
+        # 给出 host 与伪 dsn='host:port'，此时以 host/port 为准；仅当调用方只给了 dsn
+        #（无 host）时才回退使用 dsn，避免 dsn 被静默丢弃。
+        if not cargs.get('host') and self._dsn is not None:
+            cargs['dsn'] = self._dsn
+        conn = Connection()
+        await conn._connect(cargs)
+        self._impl = conn.conn
         return self._impl
 
     def _verify_can_execute(

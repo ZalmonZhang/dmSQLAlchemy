@@ -28,6 +28,14 @@
   `create_server_side_cursor` 误用裸驱动游标，现分别改用适配游标
   `self._dbapi_connection.cursor()` / `self._dbapi_connection.ss_cursor()`。修复后
   `conn.stream()` 可流式读取大结果集（实测 20 万行，事件循环最大阻塞约 0.01s）
+* 修复了异步连接参数处理的三个脆弱点：`AsyncConnection._connect` 的
+  `Connection(*kwargs)` 把 dict 的键当位置参数传入（kwargs ≥ 19 个即 `TypeError`），
+  现改为无参构造（`Connection._connect(cargs)` 只使用 cargs 字典），并删除依赖
+  `ConnectParams` 实例化的死分支；`AsyncConnection` 收了 `dsn` 却被丢弃，现保留为
+  `self._dsn`，仅在无 `host` 时条件化回退使用（有 `host` 时以 host/port 为准，避免
+  dmAsync 的 dsn/host 互斥 `ValueError`，使 `connect_async(dsn=...)` 真正可用）；
+  `Connection._connect` 硬取 `cargs['connection_timeout']` 在 dsn-only 路径会
+  `KeyError`，改为 `cargs.get('connection_timeout') or 0`
 
 #### dmSQLAlchemy v2.0.17(2026-4-21)
 
