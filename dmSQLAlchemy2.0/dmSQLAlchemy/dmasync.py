@@ -1465,7 +1465,9 @@ class DMExecutionContextAsync_dmasync(DMExecutionContext_dmasync):
     create_cursor = default.DefaultExecutionContext.create_cursor
 
     def create_default_cursor(self):
-        cursor = self._dbapi_connection.raw.cursor()
+        # 返回适配游标（AsyncAdapt_dmasync_cursor），供非流式查询使用；
+        # 原实现误用 .raw.cursor()（裸 dmAsync Cursor），与适配层期望不符。
+        cursor = self._dbapi_connection.cursor()
 
         if self.dialect.arraysize:
             cursor.arraysize = self.dialect.arraysize
@@ -1473,19 +1475,17 @@ class DMExecutionContextAsync_dmasync(DMExecutionContext_dmasync):
         return cursor
 
     def create_server_side_cursor(self):
-        c = self._dbapi_connection.raw.cursor()
+        # 返回服务端游标适配（AsyncAdapt_dmasync_ss_cursor），供 stream()/stream_results 使用。
+        c = self._dbapi_connection.ss_cursor()
         if self.dialect.arraysize:
             c.arraysize = self.dialect.arraysize
 
         return c
 
-    def create_cursor(self):
-        cursor = self._dbapi_connection.cursor()
-
-        if self.dialect.arraysize:
-            cursor.arraysize = self.dialect.arraysize
-
-        return cursor
+    # 注意：此处不能再定义 create_cursor()，否则会覆盖上一行的
+    # create_cursor = default.DefaultExecutionContext.create_cursor，
+    # 导致 _is_server_side 恒为 False、AsyncConnection.stream() 报 AssertionError，
+    # stream_results 也会静默退化为普通游标。
 
     def get_cols_from_lastrowid(self, table, primary_columns, lastrowid):
         reserved_words = set([x.lower() for x in globalvars.get_var('RESERVED_WORDS')])
