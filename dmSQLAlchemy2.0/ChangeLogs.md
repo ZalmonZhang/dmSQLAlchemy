@@ -21,6 +21,13 @@
   "批量 + `RETURNING`"，但达梦驱动实际不支持（数组 out 变量与结果集式 `RETURNING` 均不可用），
   现不再声明该能力，由 SQLAlchemy 自动改用逐行插入，主键正确回填；同步的 `FlushError` 与
   异步的 `TypeError` 一并消除，且 `return_defaults()` + `executemany` 不再静默返回错误主键
+* 修复了异步方言无法使用服务端游标的问题：异步执行上下文末尾重新定义的 `create_cursor`
+  覆盖了基类 `create_cursor = default.DefaultExecutionContext.create_cursor`，导致
+  `_is_server_side` 恒为 False，`AsyncConnection.stream()` 直接 `AssertionError`、
+  `stream_results` 静默退化为普通游标；同时 `create_default_cursor` /
+  `create_server_side_cursor` 误用裸驱动游标，现分别改用适配游标
+  `self._dbapi_connection.cursor()` / `self._dbapi_connection.ss_cursor()`。修复后
+  `conn.stream()` 可流式读取大结果集（实测 20 万行，事件循环最大阻塞约 0.01s）
 
 #### dmSQLAlchemy v2.0.17(2026-4-21)
 
