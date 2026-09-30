@@ -191,23 +191,18 @@ class DMDialect_dmPython(DMDialect):
     driver = "dmPython"
 
     def my_json_deserializer(self,value):
+        # 对齐主流：None 原样返回，其余交给标准 json.loads。
+        # 注：原生 JSON 列的实际读回解码由 extensions.py 的 json_proc_decorator 完成。
         import json
         if value is None:
             return None
-        try:
-            if isinstance(value,str):
-                return json.loads(value)
-        except Exception as e:
-            print(e)
-        try:
-            return json.loads("{}".format(value))
-        except Exception as e:
-            print(e)
-        return "{}".format(value)
+        return json.loads(value)
     _json_deserializer = my_json_deserializer
 
     def my_json_serializer(self,value):
-        return value
+        # 对齐主流：使用标准 json.dumps，供基类 sqltypes.JSON 的 bind_processor 调用。
+        import json
+        return json.dumps(value)
 
     _json_serializer = my_json_serializer
 

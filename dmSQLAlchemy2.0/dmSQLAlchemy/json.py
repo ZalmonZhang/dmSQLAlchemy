@@ -25,13 +25,12 @@ class JSON(sqltypes.JSON):
     def get_dbapi_type(self, dbapi):
         return dbapi.VARCHAR
 
-    def bind_processor(self, dialect):
-        def process(value):
-            import json
-            return json.dumps(value) if value is not None and isinstance(value,dict) else value
-
-        return process
-
+    # 不再覆盖 bind_processor（对齐 SQLAlchemy 主流方言：PG/MySQL/SQLite/MSSQL 均不覆盖）：
+    # 交回基类 sqltypes.JSON 处理，由 dialect._json_serializer（见 dmpython.py 的
+    # my_json_serializer = json.dumps）对所有非 None 值真序列化；None 走 core 语义
+    # （none_as_null=False）写成 JSON 'null'，而非 SQL NULL。
+    # 历史实现只对 dict 调用 json.dumps、其余值原样透传，导致 list/标量未被序列化：
+    # [] 被写成 SQL NULL（静默丢数据）、'hello' 触发 -3105、'' 落 SQL NULL、True 写成 '1'。
     def result_processor(self, dialect, coltype):
 
         @dialect.compatible_module.json_proc_decorator

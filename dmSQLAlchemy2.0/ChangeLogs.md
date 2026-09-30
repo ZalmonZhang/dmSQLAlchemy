@@ -36,6 +36,17 @@
   dmAsync 的 dsn/host 互斥 `ValueError`，使 `connect_async(dsn=...)` 真正可用）；
   `Connection._connect` 硬取 `cargs['connection_timeout']` 在 dsn-only 路径会
   `KeyError`，改为 `cargs.get('connection_timeout') or 0`
+* 对齐 SQLAlchemy 主流方言的 JSON 写入语义（同步、异步方言均生效）：`dmSQLAlchemy/json.py`
+  不再覆盖 `JSON.bind_processor`，改由基类 `sqltypes.JSON` 统一处理，并令 `dmpython.py` 的
+  `_json_serializer` 使用标准 `json.dumps`。此前实现只对 `dict` 调用 `json.dumps`、其余值
+  原样透传，存在 6 类行为偏差，现全部消除：`None` 由 SQL NULL 改为 JSON `null`；空串 `''`
+  由 SQL NULL 改为 `'""'`；`'hello'` 由报错 `-3105` 改为写入字符串 `'"hello"'`；`'["x"]'`
+  由被当作 JSON 数组改为写入字符串；`[]` 由 SQL NULL（静默丢数据）改为 `'[]'`；`True` 由
+  `'1'` 改为 `'true'`。对齐后所有非 `None` 值一律真序列化，语义与 PostgreSQL / MySQL /
+  SQLite / SQL Server 一致
+* 简化了 `dmpython.py` 的 `_json_deserializer`：由多段 `try/except`（失败时静默返回 `"{}"`）
+  改为 `None → None`、否则 `json.loads`。该钩子不在原生 JSON 列的实际读回路径上
+  （读回解码由 `extensions.py` 的 `json_proc_decorator` 完成），属代码整洁性调整，行为无变化
 
 #### dmSQLAlchemy v2.0.17(2026-4-21)
 
